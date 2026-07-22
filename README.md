@@ -49,9 +49,10 @@ A successful ThingSpeak upload prints status code `200` in the Serial Monitor.
 ## Automatic joint-limit recovery
 
 Normal tracking uses large command steps for a large LDR imbalance and
-one-command-unit steps near alignment. The four readings also pass through a
-fast first-order low-pass filter (`tau = 80 ms`), so flashlight changes appear
-quickly without letting single ADC spikes shake the panel.
+one-command-unit steps near alignment. It holds both axes when their respective
+filtered LDR errors are within `+/-30` ADC counts. The four readings also pass
+through a fast first-order low-pass filter (`tau = 80 ms`), so flashlight
+changes appear quickly without letting single ADC spikes shake the panel.
 
 If an LDR error continues requesting motion after a servo reaches command `0`
 or `180` for 250 ms, the tracker stops requesting that direction and enters
@@ -65,8 +66,11 @@ singularity:
 3. If the reindex does not help, or the tilt axis is blocked, it performs a
    nonblocking serpentine 5x5 search across the configured servo command range,
    remembers the best measured pose, returns there, and resumes fine tracking.
-4. An 8-second cooldown prevents an unreachable light source from causing
-   continuous full-range scans.
+4. After returning to the best pose, it locks out repeat searches. Another
+   search is permitted only when either filtered LDR axis error changes by more
+   than 30 ADC counts, followed by the normal 250 ms limit confirmation. This
+   prevents an unreachable light source from causing continuous full-range
+   scans.
 
 The Serial Monitor prints `mode=TRACK`, `mode=FLIP-*`, or `mode=SCAN-*` so the
 behavior is visible during testing. Wi-Fi, telemetry, sensor updates, and serial

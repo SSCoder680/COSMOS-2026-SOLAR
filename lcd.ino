@@ -41,7 +41,7 @@ const int TILT_SERVO_MAX_PULSE_US = 2500;
 
 // Command where the panel normal aligns with the bottom servo's pan axis.
 const int TILT_AXIS_ALIGNMENT_COMMAND = 90;
-const int LIGHT_DEADBAND = 10;
+const int LIGHT_DEADBAND = 30;
 const unsigned long UPDATE_INTERVAL_MS = 20;
 const unsigned long PRINT_INTERVAL_MS = 100;
 const unsigned long WIFI_RETRY_INTERVAL_MS = 15000;
@@ -57,7 +57,6 @@ const float LDR_FILTER_TIME_CONSTANT_MS = 80.0f;
 const int LIMIT_TRIGGER_ERROR = 80;
 const int MIN_RECOVERY_BRIGHTNESS = 500;
 const unsigned long LIMIT_CONFIRM_MS = 250;
-const unsigned long RECOVERY_COOLDOWN_MS = 8000;
 const int AXIS_ALIGNMENT_PAN_HOLD_COMMANDS = 5;
 const int RECOVERY_SLEW_COMMANDS = 6;
 const unsigned long SCAN_SETTLE_MS = 100;
@@ -123,8 +122,9 @@ TrackerMode trackerMode = TRACKING;
 LimitReason pendingLimitReason = NO_LIMIT;
 bool limitTimerRunning = false;
 unsigned long limitRequestStartedMs = 0;
-bool recoveryHasRun = false;
-unsigned long lastRecoveryFinishedMs = 0;
+bool recoveryHoldActive = false;
+int recoveryHoldHorizontalError = 0;
+int recoveryHoldVerticalError = 0;
 
 int recoveryOriginPan = 90;
 int recoveryOriginTilt = 90;
@@ -300,12 +300,13 @@ void beginGridScan(unsigned long now) {
   Serial.println("Limit recovery: starting bounded 5x5 light search.");
 }
 
-void finishRecovery(unsigned long now) {
+void finishRecovery() {
   trackerMode = TRACKING;
   pendingLimitReason = NO_LIMIT;
   limitTimerRunning = false;
-  recoveryHasRun = true;
-  lastRecoveryFinishedMs = now;
+  recoveryHoldActive = true;
+  recoveryHoldHorizontalError = horizontalError;
+  recoveryHoldVerticalError = verticalError;
 
   Serial.print("Limit recovery complete. Best score/pose: ");
   Serial.print(recoveryBestScore);
@@ -313,6 +314,9 @@ void finishRecovery(unsigned long now) {
   Serial.print(panAngle);
   Serial.print('/');
   Serial.println(tiltAngle);
+  Serial.print("Recovery pose locked until an LDR axis error changes by more than ");
+  Serial.print(LIGHT_DEADBAND);
+  Serial.println(" ADC counts.");
 }
 
 void startRecovery(LimitReason reason, unsigned long now) {
@@ -350,15 +354,39 @@ void startRecovery(LimitReason reason, unsigned long now) {
   beginGridScan(now);
 }
 
-bool recoveryAllowed(unsigned long now) {
-  return !recoveryHasRun ||
-         now - lastRecoveryFinishedMs >= RECOVERY_COOLDOWN_MS;
-}
-
 void updateLimitRequest(LimitReason reason, unsigned long now) {
   if (reason == NO_LIMIT) {
     pendingLimitReason = NO_LIMIT;
     limitTimerRunning = false;
+    recoveryHoldActive = false;
+    return;
+  }
+
+  if (recoveryHoldActive) {
+    const bool lightChanged =
+        abs(horizontalError - recoveryHoldHorizontalError) > LIGHT_DEADBAND ||
+        abs(verticalError - recoveryHoldVerticalError) > LIGHT_DEADBAND;
+    if (!lightChanged) {
+      pendingLimitReason = reason;
+      limitTimerRunning = false;
+      return;
+    }
+
+    // Require the changed LDR pattern and the blocked direction to persist
+    // together. A single filtered spike cannot launch another full scan.
+    if (!limitTimerRunning || reason != pendingLimitReason) {
+      pendingLimitReason = reason;
+      limitRequestStartedMs = now;
+      limitTimerRunning = true;
+      return;
+    }
+
+    if (now - limitRequestStartedMs >= LIMIT_CONFIRM_MS &&
+        totalBrightness() >= MIN_RECOVERY_BRIGHTNESS) {
+      recoveryHoldActive = false;
+      Serial.println("Persistent LDR change: joint-limit recovery re-armed.");
+      startRecovery(reason, now);
+    }
     return;
   }
 
@@ -370,7 +398,6 @@ void updateLimitRequest(LimitReason reason, unsigned long now) {
   }
 
   if (now - limitRequestStartedMs >= LIMIT_CONFIRM_MS &&
-      recoveryAllowed(now) &&
       totalBrightness() >= MIN_RECOVERY_BRIGHTNESS) {
     startRecovery(reason, now);
   }
@@ -485,7 +512,7 @@ void serviceRecovery(unsigned long now) {
 
     case FINAL_SETTLE:
       if (now - recoveryStateStartedMs >= FINAL_SETTLE_MS) {
-        finishRecovery(now);
+        finishRecovery();
       }
       return;
   }
@@ -590,6 +617,9 @@ void setup() {
 
   Serial.println("Adaptive four-LDR solar tracker started.");
   Serial.println("Lower ADC value is treated as brighter.");
+  Serial.print("LDR balance deadband: +/-");
+  Serial.print(LIGHT_DEADBAND);
+  Serial.println(" ADC counts.");
   Serial.println("Persistent joint limits trigger automatic light reacquisition.");
 }
 
