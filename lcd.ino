@@ -25,11 +25,33 @@ const int TILT_DIRECTION = 1;
 
 const int SERVO_MIN_ANGLE = 10;
 const int SERVO_MAX_ANGLE = 170;
-const int LIGHT_DEADBAND = 80;
+// This must be the command where the panel normal aligns with the pan axis.
+const int TILT_ZENITH_ANGLE = 90;
+const int LIGHT_DEADBAND = 10;
 const unsigned long UPDATE_INTERVAL_MS = 20;
 const unsigned long PRINT_INTERVAL_MS = 100;
 const unsigned long WIFI_RETRY_INTERVAL_MS = 15000;
 const unsigned long THINGSPEAK_UPLOAD_INTERVAL_MS = 20000;
+
+// H(s) = 1 / (tau*s + 1), discretized as an exponential moving average.
+// At a 20 ms sample interval, tau=80 ms gives alpha=0.20: quick, but much
+// less sensitive to ADC noise than one unfiltered conversion.
+const float LDR_FILTER_TIME_CONSTANT_MS = 80.0f;
+
+// Joint-limit recovery settings. A limit must be requested continuously before
+// a scan starts, so one noisy reading cannot send the panel across its range.
+const int LIMIT_TRIGGER_ERROR = 80;
+const int MIN_RECOVERY_BRIGHTNESS = 500;
+const unsigned long LIMIT_CONFIRM_MS = 400;
+const unsigned long RECOVERY_COOLDOWN_MS = 8000;
+const int ZENITH_PAN_HOLD_DEGREES = 5;
+const int RECOVERY_SLEW_DEGREES = 6;
+const unsigned long SCAN_SETTLE_MS = 100;
+const int SCAN_SAMPLE_COUNT = 4;
+const unsigned long FINAL_SETTLE_MS = 220;
+const int SCAN_GRID_SIZE = 5;
+const int SCAN_POINT_COUNT = SCAN_GRID_SIZE * SCAN_GRID_SIZE;
+const int FLIP_ACCEPT_PERCENT = 3;
 
 Servo panServo;
 Servo tiltServo;
@@ -54,7 +76,56 @@ int bottomRight = 0;
 int horizontalError = 0;
 int verticalError = 0;
 
-int readLdr(int pin) {
+float filteredTopLeft = 0.0f;
+float filteredTopRight = 0.0f;
+float filteredBottomLeft = 0.0f;
+float filteredBottomRight = 0.0f;
+bool ldrFilterInitialized = false;
+
+enum TrackerMode {
+  TRACKING,
+  FLIP_TO_ZENITH,
+  FLIP_MOVE_PAN,
+  FLIP_RESTORE_TILT,
+  FLIP_SETTLE,
+  FLIP_SAMPLE,
+  SCAN_MOVE,
+  SCAN_SETTLE,
+  SCAN_SAMPLE,
+  RETURN_TO_BEST,
+  FINAL_SETTLE
+};
+
+enum LimitReason {
+  NO_LIMIT,
+  PAN_MIN_LIMIT,
+  PAN_MAX_LIMIT,
+  TILT_MIN_LIMIT,
+  TILT_MAX_LIMIT,
+  PAN_ZENITH_SINGULARITY
+};
+
+TrackerMode trackerMode = TRACKING;
+LimitReason pendingLimitReason = NO_LIMIT;
+bool limitTimerRunning = false;
+unsigned long limitRequestStartedMs = 0;
+bool recoveryHasRun = false;
+unsigned long lastRecoveryFinishedMs = 0;
+
+int recoveryOriginPan = 90;
+int recoveryOriginTilt = 90;
+int recoveryBestPan = 90;
+int recoveryBestTilt = 90;
+int recoveryTargetPan = 90;
+int recoveryTargetTilt = 90;
+uint32_t recoveryOriginScore = 0;
+uint32_t recoveryBestScore = 0;
+uint32_t recoverySampleTotal = 0;
+int recoverySampleCount = 0;
+int scanPointIndex = 0;
+unsigned long recoveryStateStartedMs = 0;
+
+int readLdrRaw(int pin) {
   // Discard the first conversion after changing ADC channels.
   analogRead(pin);
 
@@ -65,10 +136,343 @@ int readLdr(int pin) {
   return total / 4;
 }
 
+void updateLdrReadings() {
+  const int rawTopLeft = readLdrRaw(LDR_TOP_LEFT_PIN);
+  const int rawTopRight = readLdrRaw(LDR_TOP_RIGHT_PIN);
+  const int rawBottomLeft = readLdrRaw(LDR_BOTTOM_LEFT_PIN);
+  const int rawBottomRight = readLdrRaw(LDR_BOTTOM_RIGHT_PIN);
+
+  if (!ldrFilterInitialized) {
+    filteredTopLeft = rawTopLeft;
+    filteredTopRight = rawTopRight;
+    filteredBottomLeft = rawBottomLeft;
+    filteredBottomRight = rawBottomRight;
+    ldrFilterInitialized = true;
+  } else {
+    const float alpha = UPDATE_INTERVAL_MS /
+                        (LDR_FILTER_TIME_CONSTANT_MS + UPDATE_INTERVAL_MS);
+    filteredTopLeft += alpha * (rawTopLeft - filteredTopLeft);
+    filteredTopRight += alpha * (rawTopRight - filteredTopRight);
+    filteredBottomLeft += alpha * (rawBottomLeft - filteredBottomLeft);
+    filteredBottomRight += alpha * (rawBottomRight - filteredBottomRight);
+  }
+
+  topLeft = (int)(filteredTopLeft + 0.5f);
+  topRight = (int)(filteredTopRight + 0.5f);
+  bottomLeft = (int)(filteredBottomLeft + 0.5f);
+  bottomRight = (int)(filteredBottomRight + 0.5f);
+
+  const int leftAdc = (topLeft + bottomLeft) / 2;
+  const int rightAdc = (topRight + bottomRight) / 2;
+  const int topAdc = (topLeft + topRight) / 2;
+  const int bottomAdc = (bottomLeft + bottomRight) / 2;
+
+  // The LDRs pull the ADC pins toward ground, so lower ADC means brighter.
+  // Positive horizontal error means the right side is brighter.
+  // Positive vertical error means the top side is brighter.
+  horizontalError = leftAdc - rightAdc;
+  verticalError = bottomAdc - topAdc;
+}
+
 int movementStep(int errorSize) {
   if (errorSize > 800) return 6;  // Large correction
   if (errorSize > 300) return 3;  // Medium correction
+  if (errorSize > 80) return 2;   // Small correction
   return 1;                       // Fine correction
+}
+
+int signOf(int value) {
+  return (value > 0) - (value < 0);
+}
+
+int effectivePanDirection() {
+  // In a stacked pan/tilt mount, panel-left and panel-right swap relative to
+  // increasing pan after the panel passes through the pan-axis singularity.
+  const int distanceFromZenith = abs(tiltAngle - TILT_ZENITH_ANGLE);
+  if (distanceFromZenith <= ZENITH_PAN_HOLD_DEGREES) return 0;
+  return PAN_DIRECTION * (tiltAngle < TILT_ZENITH_ANGLE ? 1 : -1);
+}
+
+int totalBrightness() {
+  return (4095 - topLeft) +
+         (4095 - topRight) +
+         (4095 - bottomLeft) +
+         (4095 - bottomRight);
+}
+
+uint32_t opticalScore() {
+  // Higher is better. Total light rejects a dark-but-equal pose; the balance
+  // term rejects a pose where only one corner sees the light.
+  const int brightness = totalBrightness();
+  if (brightness <= 0) return 0;
+
+  const int imbalance =
+      2 * (abs(horizontalError) + abs(verticalError));
+  const int balancePermille =
+      max(0, 1000 - (500 * imbalance) / brightness);
+  return ((uint32_t)(brightness / 4) * balancePermille) / 1000;
+}
+
+const char *trackerModeName() {
+  switch (trackerMode) {
+    case TRACKING: return "TRACK";
+    case FLIP_TO_ZENITH: return "FLIP-ZENITH";
+    case FLIP_MOVE_PAN: return "FLIP-PAN";
+    case FLIP_RESTORE_TILT: return "FLIP-TILT";
+    case FLIP_SETTLE: return "FLIP-SETTLE";
+    case FLIP_SAMPLE: return "FLIP-SAMPLE";
+    case SCAN_MOVE: return "SCAN-MOVE";
+    case SCAN_SETTLE: return "SCAN-SETTLE";
+    case SCAN_SAMPLE: return "SCAN-SAMPLE";
+    case RETURN_TO_BEST: return "RETURN-BEST";
+    case FINAL_SETTLE: return "FINAL-SETTLE";
+  }
+  return "UNKNOWN";
+}
+
+void enterRecoveryState(TrackerMode newMode, unsigned long now) {
+  trackerMode = newMode;
+  recoveryStateStartedMs = now;
+}
+
+int approachAngle(int current, int target, int maximumStep) {
+  if (current < target) return min(current + maximumStep, target);
+  if (current > target) return max(current - maximumStep, target);
+  return current;
+}
+
+bool slewRecoveryServos() {
+  const int nextPan =
+      approachAngle(panAngle, recoveryTargetPan, RECOVERY_SLEW_DEGREES);
+  const int nextTilt =
+      approachAngle(tiltAngle, recoveryTargetTilt, RECOVERY_SLEW_DEGREES);
+
+  if (nextPan != panAngle) {
+    panAngle = nextPan;
+    panServo.write(panAngle);
+  }
+  if (nextTilt != tiltAngle) {
+    tiltAngle = nextTilt;
+    tiltServo.write(tiltAngle);
+  }
+
+  return panAngle == recoveryTargetPan && tiltAngle == recoveryTargetTilt;
+}
+
+void resetRecoverySamples() {
+  recoverySampleTotal = 0;
+  recoverySampleCount = 0;
+}
+
+void setScanTarget(int index) {
+  const int row = index / SCAN_GRID_SIZE;
+  int column = index % SCAN_GRID_SIZE;
+  if (row % 2 == 1) column = SCAN_GRID_SIZE - 1 - column;
+
+  recoveryTargetPan = SERVO_MIN_ANGLE +
+      (column * (SERVO_MAX_ANGLE - SERVO_MIN_ANGLE)) /
+          (SCAN_GRID_SIZE - 1);
+  recoveryTargetTilt = SERVO_MIN_ANGLE +
+      (row * (SERVO_MAX_ANGLE - SERVO_MIN_ANGLE)) /
+          (SCAN_GRID_SIZE - 1);
+}
+
+void beginGridScan(unsigned long now) {
+  scanPointIndex = 0;
+  setScanTarget(scanPointIndex);
+  enterRecoveryState(SCAN_MOVE, now);
+  Serial.println("Limit recovery: starting bounded 5x5 light search.");
+}
+
+void finishRecovery(unsigned long now) {
+  trackerMode = TRACKING;
+  pendingLimitReason = NO_LIMIT;
+  limitTimerRunning = false;
+  recoveryHasRun = true;
+  lastRecoveryFinishedMs = now;
+
+  Serial.print("Limit recovery complete. Best score/pose: ");
+  Serial.print(recoveryBestScore);
+  Serial.print(" at ");
+  Serial.print(panAngle);
+  Serial.print('/');
+  Serial.println(tiltAngle);
+}
+
+void startRecovery(LimitReason reason, unsigned long now) {
+  pendingLimitReason = reason;
+  recoveryOriginPan = panAngle;
+  recoveryOriginTilt = tiltAngle;
+  recoveryOriginScore = opticalScore();
+  recoveryBestPan = panAngle;
+  recoveryBestTilt = tiltAngle;
+  recoveryBestScore = recoveryOriginScore;
+
+  Serial.print("Persistent joint limit detected. Origin score/pose: ");
+  Serial.print(recoveryOriginScore);
+  Serial.print(" at ");
+  Serial.print(recoveryOriginPan);
+  Serial.print('/');
+  Serial.println(recoveryOriginTilt);
+
+  // A blocked pan gets a fast, geometry-aware over-the-top probe first. The
+  // 10..170 degree safe range is not a full 180 degrees, so this is only a
+  // candidate: real LDR measurements decide whether it is kept.
+  if (reason == PAN_MIN_LIMIT || reason == PAN_MAX_LIMIT) {
+    const int mirroredTilt =
+        2 * TILT_ZENITH_ANGLE - recoveryOriginTilt;
+    if (mirroredTilt >= SERVO_MIN_ANGLE &&
+        mirroredTilt <= SERVO_MAX_ANGLE) {
+      recoveryTargetPan = recoveryOriginPan;
+      recoveryTargetTilt = TILT_ZENITH_ANGLE;
+      enterRecoveryState(FLIP_TO_ZENITH, now);
+      Serial.println("Limit recovery: trying measured over-the-top reindex.");
+      return;
+    }
+  }
+
+  beginGridScan(now);
+}
+
+bool recoveryAllowed(unsigned long now) {
+  return !recoveryHasRun ||
+         now - lastRecoveryFinishedMs >= RECOVERY_COOLDOWN_MS;
+}
+
+void updateLimitRequest(LimitReason reason, unsigned long now) {
+  if (reason == NO_LIMIT) {
+    pendingLimitReason = NO_LIMIT;
+    limitTimerRunning = false;
+    return;
+  }
+
+  if (!limitTimerRunning || reason != pendingLimitReason) {
+    pendingLimitReason = reason;
+    limitRequestStartedMs = now;
+    limitTimerRunning = true;
+    return;
+  }
+
+  if (now - limitRequestStartedMs >= LIMIT_CONFIRM_MS &&
+      recoveryAllowed(now) &&
+      totalBrightness() >= MIN_RECOVERY_BRIGHTNESS) {
+    startRecovery(reason, now);
+  }
+}
+
+void serviceRecovery(unsigned long now) {
+  switch (trackerMode) {
+    case TRACKING:
+      return;
+
+    case FLIP_TO_ZENITH:
+      if (slewRecoveryServos()) {
+        recoveryTargetPan =
+            pendingLimitReason == PAN_MAX_LIMIT
+                ? SERVO_MIN_ANGLE
+                : SERVO_MAX_ANGLE;
+        recoveryTargetTilt = TILT_ZENITH_ANGLE;
+        enterRecoveryState(FLIP_MOVE_PAN, now);
+      }
+      return;
+
+    case FLIP_MOVE_PAN:
+      if (slewRecoveryServos()) {
+        recoveryTargetTilt =
+            2 * TILT_ZENITH_ANGLE - recoveryOriginTilt;
+        enterRecoveryState(FLIP_RESTORE_TILT, now);
+      }
+      return;
+
+    case FLIP_RESTORE_TILT:
+      if (slewRecoveryServos()) {
+        enterRecoveryState(FLIP_SETTLE, now);
+      }
+      return;
+
+    case FLIP_SETTLE:
+      if (now - recoveryStateStartedMs >= SCAN_SETTLE_MS) {
+        resetRecoverySamples();
+        enterRecoveryState(FLIP_SAMPLE, now);
+      }
+      return;
+
+    case FLIP_SAMPLE:
+      recoverySampleTotal += opticalScore();
+      recoverySampleCount++;
+      if (recoverySampleCount >= SCAN_SAMPLE_COUNT) {
+        const uint32_t candidateScore =
+            recoverySampleTotal / recoverySampleCount;
+        if (candidateScore > recoveryBestScore) {
+          recoveryBestScore = candidateScore;
+          recoveryBestPan = panAngle;
+          recoveryBestTilt = tiltAngle;
+        }
+
+        const uint32_t requiredImprovement =
+            max((uint32_t)15,
+                (recoveryOriginScore * FLIP_ACCEPT_PERCENT) / 100);
+        if (candidateScore >= recoveryOriginScore + requiredImprovement) {
+          Serial.println("Over-the-top pose improved the measured light.");
+          recoveryTargetPan = recoveryBestPan;
+          recoveryTargetTilt = recoveryBestTilt;
+          enterRecoveryState(FINAL_SETTLE, now);
+        } else {
+          Serial.println("Over-the-top pose was not clearly better.");
+          beginGridScan(now);
+        }
+      }
+      return;
+
+    case SCAN_MOVE:
+      if (slewRecoveryServos()) {
+        enterRecoveryState(SCAN_SETTLE, now);
+      }
+      return;
+
+    case SCAN_SETTLE:
+      if (now - recoveryStateStartedMs >= SCAN_SETTLE_MS) {
+        resetRecoverySamples();
+        enterRecoveryState(SCAN_SAMPLE, now);
+      }
+      return;
+
+    case SCAN_SAMPLE:
+      recoverySampleTotal += opticalScore();
+      recoverySampleCount++;
+      if (recoverySampleCount >= SCAN_SAMPLE_COUNT) {
+        const uint32_t candidateScore =
+            recoverySampleTotal / recoverySampleCount;
+        if (candidateScore > recoveryBestScore) {
+          recoveryBestScore = candidateScore;
+          recoveryBestPan = panAngle;
+          recoveryBestTilt = tiltAngle;
+        }
+
+        scanPointIndex++;
+        if (scanPointIndex < SCAN_POINT_COUNT) {
+          setScanTarget(scanPointIndex);
+          enterRecoveryState(SCAN_MOVE, now);
+        } else {
+          recoveryTargetPan = recoveryBestPan;
+          recoveryTargetTilt = recoveryBestTilt;
+          enterRecoveryState(RETURN_TO_BEST, now);
+        }
+      }
+      return;
+
+    case RETURN_TO_BEST:
+      if (slewRecoveryServos()) {
+        enterRecoveryState(FINAL_SETTLE, now);
+      }
+      return;
+
+    case FINAL_SETTLE:
+      if (now - recoveryStateStartedMs >= FINAL_SETTLE_MS) {
+        finishRecovery(now);
+      }
+      return;
+  }
 }
 
 bool cloudConfigured() {
@@ -166,8 +570,9 @@ void setup() {
   panServo.write(panAngle);
   tiltServo.write(tiltAngle);
 
-  Serial.println("Simple four-LDR solar tracker started.");
+  Serial.println("Adaptive four-LDR solar tracker started.");
   Serial.println("Lower ADC value is treated as brighter.");
+  Serial.println("Persistent joint limits trigger automatic light reacquisition.");
 }
 
 void loop() {
@@ -176,34 +581,70 @@ void loop() {
   if (now - lastUpdateMs >= UPDATE_INTERVAL_MS) {
     lastUpdateMs = now;
 
-    topLeft = readLdr(LDR_TOP_LEFT_PIN);
-    topRight = readLdr(LDR_TOP_RIGHT_PIN);
-    bottomLeft = readLdr(LDR_BOTTOM_LEFT_PIN);
-    bottomRight = readLdr(LDR_BOTTOM_RIGHT_PIN);
+    updateLdrReadings();
 
-    const int leftAdc = (topLeft + bottomLeft) / 2;
-    const int rightAdc = (topRight + bottomRight) / 2;
-    const int topAdc = (topLeft + topRight) / 2;
-    const int bottomAdc = (bottomLeft + bottomRight) / 2;
+    if (trackerMode == TRACKING) {
+      int requestedPanDelta = 0;
+      int requestedTiltDelta = 0;
 
-    // The LDRs pull the ADC pins toward ground, so lower ADC means brighter.
-    // Positive horizontal error means the right side is brighter.
-    // Positive vertical error means the top side is brighter.
-    horizontalError = leftAdc - rightAdc;
-    verticalError = bottomAdc - topAdc;
+      if (abs(horizontalError) > LIGHT_DEADBAND) {
+        requestedPanDelta =
+            signOf(horizontalError) *
+            effectivePanDirection() *
+            movementStep(abs(horizontalError));
+      }
+      if (abs(verticalError) > LIGHT_DEADBAND) {
+        requestedTiltDelta =
+            signOf(verticalError) *
+            TILT_DIRECTION *
+            movementStep(abs(verticalError));
+      }
 
-    if (abs(horizontalError) > LIGHT_DEADBAND) {
-      const int step = movementStep(abs(horizontalError));
-      panAngle += (horizontalError > 0 ? 1 : -1) * PAN_DIRECTION * step;
-      panAngle = constrain(panAngle, SERVO_MIN_ANGLE, SERVO_MAX_ANGLE);
-      panServo.write(panAngle);
-    }
+      const bool panBlockedAtMin =
+          panAngle <= SERVO_MIN_ANGLE && requestedPanDelta < 0 &&
+          abs(horizontalError) >= LIMIT_TRIGGER_ERROR;
+      const bool panBlockedAtMax =
+          panAngle >= SERVO_MAX_ANGLE && requestedPanDelta > 0 &&
+          abs(horizontalError) >= LIMIT_TRIGGER_ERROR;
+      const bool tiltBlockedAtMin =
+          tiltAngle <= SERVO_MIN_ANGLE && requestedTiltDelta < 0 &&
+          abs(verticalError) >= LIMIT_TRIGGER_ERROR;
+      const bool tiltBlockedAtMax =
+          tiltAngle >= SERVO_MAX_ANGLE && requestedTiltDelta > 0 &&
+          abs(verticalError) >= LIMIT_TRIGGER_ERROR;
+      const bool panBlockedAtZenith =
+          effectivePanDirection() == 0 &&
+          abs(horizontalError) >= LIMIT_TRIGGER_ERROR;
 
-    if (abs(verticalError) > LIGHT_DEADBAND) {
-      const int step = movementStep(abs(verticalError));
-      tiltAngle += (verticalError > 0 ? 1 : -1) * TILT_DIRECTION * step;
-      tiltAngle = constrain(tiltAngle, SERVO_MIN_ANGLE, SERVO_MAX_ANGLE);
-      tiltServo.write(tiltAngle);
+      LimitReason limitReason = NO_LIMIT;
+      if (panBlockedAtZenith) limitReason = PAN_ZENITH_SINGULARITY;
+      if (panBlockedAtMin) limitReason = PAN_MIN_LIMIT;
+      if (panBlockedAtMax) limitReason = PAN_MAX_LIMIT;
+      if (tiltBlockedAtMin) limitReason = TILT_MIN_LIMIT;
+      if (tiltBlockedAtMax) limitReason = TILT_MAX_LIMIT;
+      updateLimitRequest(limitReason, now);
+
+      // Once recovery starts, it owns both servos until it has measured and
+      // returned to the best reachable pose.
+      if (trackerMode == TRACKING) {
+        if (requestedPanDelta != 0 && !panBlockedAtMin && !panBlockedAtMax) {
+          panAngle = constrain(
+              panAngle + requestedPanDelta,
+              SERVO_MIN_ANGLE,
+              SERVO_MAX_ANGLE);
+          panServo.write(panAngle);
+        }
+
+        if (requestedTiltDelta != 0 && !tiltBlockedAtMin && !tiltBlockedAtMax) {
+          tiltAngle = constrain(
+              tiltAngle + requestedTiltDelta,
+              SERVO_MIN_ANGLE,
+              SERVO_MAX_ANGLE);
+          tiltServo.write(tiltAngle);
+        }
+      }
+    } else {
+      serviceRecovery(now);
     }
   }
 
@@ -225,7 +666,11 @@ void loop() {
     Serial.print("  servo pan/tilt=");
     Serial.print(panAngle);
     Serial.print('/');
-    Serial.println(tiltAngle);
+    Serial.print(tiltAngle);
+    Serial.print("  score=");
+    Serial.print(opticalScore());
+    Serial.print("  mode=");
+    Serial.println(trackerModeName());
   }
 
   serviceWifi(now);
