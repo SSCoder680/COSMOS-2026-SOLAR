@@ -31,13 +31,13 @@ const int PAN_MAX_COMMAND = 180;
 const int TILT_MIN_COMMAND = 0;
 const int TILT_MAX_COMMAND = 180;
 
-// SG90 endpoint timing varies between units. This cautious 700..2300 us range
-// gives 60% more pulse span than 1000..2000 us without jumping directly to the
-// extreme values found in some third-party SG90 sheets.
-const int PAN_SERVO_MIN_PULSE_US = 700;
-const int PAN_SERVO_MAX_PULSE_US = 2300;
-const int TILT_SERVO_MIN_PULSE_US = 700;
-const int TILT_SERVO_MAX_PULSE_US = 2300;
+// Experimental maximum pulse span for additional SG90 travel. Individual
+// servos vary: reduce an endpoint immediately if the servo buzzes, stalls, or
+// stops moving before the command reaches 0 or 180.
+const int PAN_SERVO_MIN_PULSE_US = 500;
+const int PAN_SERVO_MAX_PULSE_US = 2500;
+const int TILT_SERVO_MIN_PULSE_US = 500;
+const int TILT_SERVO_MAX_PULSE_US = 2500;
 
 // Command where the panel normal aligns with the bottom servo's pan axis.
 const int TILT_AXIS_ALIGNMENT_COMMAND = 90;
