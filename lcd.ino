@@ -24,14 +24,20 @@ const int TILT_DIRECTION = 1;
 // ---------------- Settings ----------------
 
 // Servo.write() uses normalized command units, not measured shaft degrees.
-// 0 and 180 map to the configured 1000 and 2000 microsecond pulses. The real
+// 0 and 180 map to the configured pulse endpoints below. The real
 // physical travel may be 120, 180, 270, or another value depending on servo.
 const int PAN_MIN_COMMAND = 0;
 const int PAN_MAX_COMMAND = 180;
 const int TILT_MIN_COMMAND = 0;
 const int TILT_MAX_COMMAND = 180;
-const int SERVO_MIN_PULSE_US = 1000;
-const int SERVO_MAX_PULSE_US = 2000;
+
+// SG90 endpoint timing varies between units. This cautious 700..2300 us range
+// gives 60% more pulse span than 1000..2000 us without jumping directly to the
+// extreme values found in some third-party SG90 sheets.
+const int PAN_SERVO_MIN_PULSE_US = 700;
+const int PAN_SERVO_MAX_PULSE_US = 2300;
+const int TILT_SERVO_MIN_PULSE_US = 700;
+const int TILT_SERVO_MAX_PULSE_US = 2300;
 
 // Command where the panel normal aligns with the bottom servo's pan axis.
 const int TILT_AXIS_ALIGNMENT_COMMAND = 90;
@@ -50,7 +56,7 @@ const float LDR_FILTER_TIME_CONSTANT_MS = 80.0f;
 // a scan starts, so one noisy reading cannot send the panel across its range.
 const int LIMIT_TRIGGER_ERROR = 80;
 const int MIN_RECOVERY_BRIGHTNESS = 500;
-const unsigned long LIMIT_CONFIRM_MS = 400;
+const unsigned long LIMIT_CONFIRM_MS = 250;
 const unsigned long RECOVERY_COOLDOWN_MS = 8000;
 const int AXIS_ALIGNMENT_PAN_HOLD_COMMANDS = 5;
 const int RECOVERY_SLEW_COMMANDS = 6;
@@ -575,9 +581,9 @@ void setup() {
   panServo.setPeriodHertz(50);
   tiltServo.setPeriodHertz(50);
   panServo.attach(
-      PAN_SERVO_PIN, SERVO_MIN_PULSE_US, SERVO_MAX_PULSE_US);
+      PAN_SERVO_PIN, PAN_SERVO_MIN_PULSE_US, PAN_SERVO_MAX_PULSE_US);
   tiltServo.attach(
-      TILT_SERVO_PIN, SERVO_MIN_PULSE_US, SERVO_MAX_PULSE_US);
+      TILT_SERVO_PIN, TILT_SERVO_MIN_PULSE_US, TILT_SERVO_MAX_PULSE_US);
 
   panServo.write(panAngle);
   tiltServo.write(tiltAngle);

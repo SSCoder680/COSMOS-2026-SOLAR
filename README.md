@@ -54,7 +54,7 @@ fast first-order low-pass filter (`tau = 80 ms`), so flashlight changes appear
 quickly without letting single ADC spikes shake the panel.
 
 If an LDR error continues requesting motion after a servo reaches command `0`
-or `180` for 400 ms, the tracker stops requesting that direction and enters
+or `180` for 250 ms, the tracker stops requesting that direction and enters
 recovery. It does the same if pan feedback is trapped in the small straight-up
 singularity:
 
@@ -82,17 +82,25 @@ at the source.
 ### Servo command range versus physical rotation
 
 `Servo.write(0..180)` uses normalized command units; those numbers are not a
-measurement of the shaft angle. In this sketch, command `0` maps to a 1000 us
-pulse and command `180` maps to 2000 us. A positional servo can physically move
-120, 180, 270, or another number of degrees over that command range.
+measurement of the shaft angle. For these TowerPro SG90 servos, command `0`
+currently maps to a 700 us pulse and command `180` maps to 2300 us. This is a
+provisional extended range with 60% more pulse span than the previous
+1000--2000 us setting; it does not guarantee 180 degrees of physical movement.
 
 A normal three-wire servo sends no shaft-position or stall feedback to the
 ESP32. Therefore, the firmware cannot safely detect the exact instant the motor
-hits a physical stop. It now uses the entire configured 1000--2000 us range and
+hits a physical stop. It now uses the entire configured 700--2300 us range and
 tries the opposite direction when the command endpoint cannot satisfy the LDRs.
-Do not expand the pulse range just to force more movement; use the servo's data
-sheet. Exact physical-stop detection requires a feedback servo, encoder, limit
+Do not expand the pulse range farther without calibrating the individual servo.
+Exact physical-stop detection requires a feedback servo, encoder, limit
 switches, or a properly designed current sensor and cutoff.
+
+For the first powered test, support or disconnect the panel load and watch each
+servo near both endpoints. If either unit buzzes, chatters, becomes warm, or
+stops moving before the command reaches an endpoint, cut servo power immediately
+and move that axis's `*_SERVO_MIN_PULSE_US` or `*_SERVO_MAX_PULSE_US` inward by
+50--100 us. Power the servos from a separate regulated 4.8--5 V supply capable
+of their current draw, with its ground connected to ESP32 ground.
 
 Two positional servos still cannot reach a direction outside their mechanical
 workspace. The search chooses the best reachable pose and avoids repeatedly
