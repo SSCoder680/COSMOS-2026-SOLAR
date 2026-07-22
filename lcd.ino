@@ -23,10 +23,18 @@ const int TILT_DIRECTION = 1;
 
 // ---------------- Settings ----------------
 
-const int SERVO_MIN_ANGLE = 10;
-const int SERVO_MAX_ANGLE = 170;
-// This must be the command where the panel normal aligns with the pan axis.
-const int TILT_ZENITH_ANGLE = 90;
+// Servo.write() uses normalized command units, not measured shaft degrees.
+// 0 and 180 map to the configured 1000 and 2000 microsecond pulses. The real
+// physical travel may be 120, 180, 270, or another value depending on servo.
+const int PAN_MIN_COMMAND = 0;
+const int PAN_MAX_COMMAND = 180;
+const int TILT_MIN_COMMAND = 0;
+const int TILT_MAX_COMMAND = 180;
+const int SERVO_MIN_PULSE_US = 1000;
+const int SERVO_MAX_PULSE_US = 2000;
+
+// Command where the panel normal aligns with the bottom servo's pan axis.
+const int TILT_AXIS_ALIGNMENT_COMMAND = 90;
 const int LIGHT_DEADBAND = 10;
 const unsigned long UPDATE_INTERVAL_MS = 20;
 const unsigned long PRINT_INTERVAL_MS = 100;
@@ -44,8 +52,8 @@ const int LIMIT_TRIGGER_ERROR = 80;
 const int MIN_RECOVERY_BRIGHTNESS = 500;
 const unsigned long LIMIT_CONFIRM_MS = 400;
 const unsigned long RECOVERY_COOLDOWN_MS = 8000;
-const int ZENITH_PAN_HOLD_DEGREES = 5;
-const int RECOVERY_SLEW_DEGREES = 6;
+const int AXIS_ALIGNMENT_PAN_HOLD_COMMANDS = 5;
+const int RECOVERY_SLEW_COMMANDS = 6;
 const unsigned long SCAN_SETTLE_MS = 100;
 const int SCAN_SAMPLE_COUNT = 4;
 const unsigned long FINAL_SETTLE_MS = 220;
@@ -188,9 +196,11 @@ int signOf(int value) {
 int effectivePanDirection() {
   // In a stacked pan/tilt mount, panel-left and panel-right swap relative to
   // increasing pan after the panel passes through the pan-axis singularity.
-  const int distanceFromZenith = abs(tiltAngle - TILT_ZENITH_ANGLE);
-  if (distanceFromZenith <= ZENITH_PAN_HOLD_DEGREES) return 0;
-  return PAN_DIRECTION * (tiltAngle < TILT_ZENITH_ANGLE ? 1 : -1);
+  const int distanceFromAxisAlignment =
+      abs(tiltAngle - TILT_AXIS_ALIGNMENT_COMMAND);
+  if (distanceFromAxisAlignment <= AXIS_ALIGNMENT_PAN_HOLD_COMMANDS) return 0;
+  return PAN_DIRECTION *
+      (tiltAngle < TILT_AXIS_ALIGNMENT_COMMAND ? 1 : -1);
 }
 
 int totalBrightness() {
@@ -235,7 +245,7 @@ void enterRecoveryState(TrackerMode newMode, unsigned long now) {
   recoveryStateStartedMs = now;
 }
 
-int approachAngle(int current, int target, int maximumStep) {
+int approachCommand(int current, int target, int maximumStep) {
   if (current < target) return min(current + maximumStep, target);
   if (current > target) return max(current - maximumStep, target);
   return current;
@@ -243,9 +253,9 @@ int approachAngle(int current, int target, int maximumStep) {
 
 bool slewRecoveryServos() {
   const int nextPan =
-      approachAngle(panAngle, recoveryTargetPan, RECOVERY_SLEW_DEGREES);
+      approachCommand(panAngle, recoveryTargetPan, RECOVERY_SLEW_COMMANDS);
   const int nextTilt =
-      approachAngle(tiltAngle, recoveryTargetTilt, RECOVERY_SLEW_DEGREES);
+      approachCommand(tiltAngle, recoveryTargetTilt, RECOVERY_SLEW_COMMANDS);
 
   if (nextPan != panAngle) {
     panAngle = nextPan;
@@ -269,11 +279,11 @@ void setScanTarget(int index) {
   int column = index % SCAN_GRID_SIZE;
   if (row % 2 == 1) column = SCAN_GRID_SIZE - 1 - column;
 
-  recoveryTargetPan = SERVO_MIN_ANGLE +
-      (column * (SERVO_MAX_ANGLE - SERVO_MIN_ANGLE)) /
+  recoveryTargetPan = PAN_MIN_COMMAND +
+      (column * (PAN_MAX_COMMAND - PAN_MIN_COMMAND)) /
           (SCAN_GRID_SIZE - 1);
-  recoveryTargetTilt = SERVO_MIN_ANGLE +
-      (row * (SERVO_MAX_ANGLE - SERVO_MIN_ANGLE)) /
+  recoveryTargetTilt = TILT_MIN_COMMAND +
+      (row * (TILT_MAX_COMMAND - TILT_MIN_COMMAND)) /
           (SCAN_GRID_SIZE - 1);
 }
 
@@ -315,16 +325,16 @@ void startRecovery(LimitReason reason, unsigned long now) {
   Serial.print('/');
   Serial.println(recoveryOriginTilt);
 
-  // A blocked pan gets a fast, geometry-aware over-the-top probe first. The
-  // 10..170 degree safe range is not a full 180 degrees, so this is only a
-  // candidate: real LDR measurements decide whether it is kept.
+  // A blocked pan gets a fast, geometry-aware over-the-top probe first. Servo
+  // commands are not measured angles, so this remains only a candidate: real
+  // LDR measurements decide whether it is kept.
   if (reason == PAN_MIN_LIMIT || reason == PAN_MAX_LIMIT) {
     const int mirroredTilt =
-        2 * TILT_ZENITH_ANGLE - recoveryOriginTilt;
-    if (mirroredTilt >= SERVO_MIN_ANGLE &&
-        mirroredTilt <= SERVO_MAX_ANGLE) {
+        2 * TILT_AXIS_ALIGNMENT_COMMAND - recoveryOriginTilt;
+    if (mirroredTilt >= TILT_MIN_COMMAND &&
+        mirroredTilt <= TILT_MAX_COMMAND) {
       recoveryTargetPan = recoveryOriginPan;
-      recoveryTargetTilt = TILT_ZENITH_ANGLE;
+      recoveryTargetTilt = TILT_AXIS_ALIGNMENT_COMMAND;
       enterRecoveryState(FLIP_TO_ZENITH, now);
       Serial.println("Limit recovery: trying measured over-the-top reindex.");
       return;
@@ -369,9 +379,9 @@ void serviceRecovery(unsigned long now) {
       if (slewRecoveryServos()) {
         recoveryTargetPan =
             pendingLimitReason == PAN_MAX_LIMIT
-                ? SERVO_MIN_ANGLE
-                : SERVO_MAX_ANGLE;
-        recoveryTargetTilt = TILT_ZENITH_ANGLE;
+                ? PAN_MIN_COMMAND
+                : PAN_MAX_COMMAND;
+        recoveryTargetTilt = TILT_AXIS_ALIGNMENT_COMMAND;
         enterRecoveryState(FLIP_MOVE_PAN, now);
       }
       return;
@@ -379,7 +389,7 @@ void serviceRecovery(unsigned long now) {
     case FLIP_MOVE_PAN:
       if (slewRecoveryServos()) {
         recoveryTargetTilt =
-            2 * TILT_ZENITH_ANGLE - recoveryOriginTilt;
+            2 * TILT_AXIS_ALIGNMENT_COMMAND - recoveryOriginTilt;
         enterRecoveryState(FLIP_RESTORE_TILT, now);
       }
       return;
@@ -564,8 +574,10 @@ void setup() {
 
   panServo.setPeriodHertz(50);
   tiltServo.setPeriodHertz(50);
-  panServo.attach(PAN_SERVO_PIN, 1000, 2000);
-  tiltServo.attach(TILT_SERVO_PIN, 1000, 2000);
+  panServo.attach(
+      PAN_SERVO_PIN, SERVO_MIN_PULSE_US, SERVO_MAX_PULSE_US);
+  tiltServo.attach(
+      TILT_SERVO_PIN, SERVO_MIN_PULSE_US, SERVO_MAX_PULSE_US);
 
   panServo.write(panAngle);
   tiltServo.write(tiltAngle);
@@ -601,16 +613,16 @@ void loop() {
       }
 
       const bool panBlockedAtMin =
-          panAngle <= SERVO_MIN_ANGLE && requestedPanDelta < 0 &&
+          panAngle <= PAN_MIN_COMMAND && requestedPanDelta < 0 &&
           abs(horizontalError) >= LIMIT_TRIGGER_ERROR;
       const bool panBlockedAtMax =
-          panAngle >= SERVO_MAX_ANGLE && requestedPanDelta > 0 &&
+          panAngle >= PAN_MAX_COMMAND && requestedPanDelta > 0 &&
           abs(horizontalError) >= LIMIT_TRIGGER_ERROR;
       const bool tiltBlockedAtMin =
-          tiltAngle <= SERVO_MIN_ANGLE && requestedTiltDelta < 0 &&
+          tiltAngle <= TILT_MIN_COMMAND && requestedTiltDelta < 0 &&
           abs(verticalError) >= LIMIT_TRIGGER_ERROR;
       const bool tiltBlockedAtMax =
-          tiltAngle >= SERVO_MAX_ANGLE && requestedTiltDelta > 0 &&
+          tiltAngle >= TILT_MAX_COMMAND && requestedTiltDelta > 0 &&
           abs(verticalError) >= LIMIT_TRIGGER_ERROR;
       const bool panBlockedAtZenith =
           effectivePanDirection() == 0 &&
@@ -630,16 +642,16 @@ void loop() {
         if (requestedPanDelta != 0 && !panBlockedAtMin && !panBlockedAtMax) {
           panAngle = constrain(
               panAngle + requestedPanDelta,
-              SERVO_MIN_ANGLE,
-              SERVO_MAX_ANGLE);
+              PAN_MIN_COMMAND,
+              PAN_MAX_COMMAND);
           panServo.write(panAngle);
         }
 
         if (requestedTiltDelta != 0 && !tiltBlockedAtMin && !tiltBlockedAtMax) {
           tiltAngle = constrain(
               tiltAngle + requestedTiltDelta,
-              SERVO_MIN_ANGLE,
-              SERVO_MAX_ANGLE);
+              TILT_MIN_COMMAND,
+              TILT_MAX_COMMAND);
           tiltServo.write(tiltAngle);
         }
       }
@@ -663,7 +675,7 @@ void loop() {
     Serial.print(horizontalError);
     Serial.print('/');
     Serial.print(verticalError);
-    Serial.print("  servo pan/tilt=");
+    Serial.print("  command pan/tilt=");
     Serial.print(panAngle);
     Serial.print('/');
     Serial.print(tiltAngle);
