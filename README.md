@@ -51,11 +51,11 @@ Configure the ThingSpeak channel fields as follows:
 8. Estimated sun elevation in degrees (`0` horizon, `90` overhead)
 
 Lower LDR ADC values mean brighter light with the documented voltage-divider
-wiring. The ESP32 tracks locally every 20 ms, prints readings every 100 ms,
+wiring. The ESP32 samples the sensors every 20 ms, prints readings every 100 ms,
 reconnects to Wi-Fi automatically, and uploads all eight fields every 20
 seconds. Geolocation and ThingSpeak requests run in background tasks, so a slow
-guest network does not pause the 20 ms servo loop. A successful ThingSpeak
-upload prints status code `200` in the Serial Monitor.
+guest network does not pause sensor sampling or a light scan. A successful
+ThingSpeak upload prints status code `200` in the Serial Monitor.
 
 ## Automatic time, location, and direction
 
@@ -73,20 +73,16 @@ as a short coordinate pair, but it is still a best-effort estimate and must not
 be used for safety-critical positioning.
 
 The firmware applies NOAA's compact solar equations every 30 seconds to
-calculate geometric sun azimuth and elevation from true north. When the sun is
-at least 5 degrees above the horizon, it first gives normal LDR tracking at
-least five seconds to align and keeps waiting while the LDR error is improving.
-Only three seconds of persistent non-improvement can start one measured 5x5
-orientation scan for that boot; it does not repeat this startup scan
-continuously.
+calculate geometric sun azimuth and elevation from true north. This estimate is
+reported to Serial and ThingSpeak, but it never overrides the strict
+brightest-light hold described below.
 
 When both LDR errors remain within `+/-30` under strong light for two seconds,
-the panel is considered locked to the sun. At that instant its detected
-absolute direction is the calculated sun azimuth/elevation. That lock also
-anchors the local servo geometry. If direct light later becomes too weak for
-the LDRs, the sun estimate may make small corrections of at most 20 degrees
-from the latest measured anchor; direct-light LDR readings immediately take
-control again.
+the firmware can associate the held panel pose with the calculated sun
+azimuth/elevation. That creates an approximate local direction anchor for
+telemetry. A coarse brightest-light pose is not guaranteed to be balanced
+within `+/-30`, so Serial may continue to show `panel direction=acquiring`; this
+does not prevent the panel from remaining locked at the best measured pose.
 
 This is the strongest automatic direction estimate possible with the existing
 four LDRs and three-wire SG90 servos. The ESP32 has no compass, accelerometer,
@@ -101,42 +97,31 @@ References: [NOAA solar-position equations](https://gml.noaa.gov/grad/solcalc/so
 [Espressif system-time/SNTP documentation](https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/system_time.html),
 and [ipwho.is geolocation API documentation](https://ipwhois.io/documentation).
 
-## Automatic joint-limit recovery
+## Brightest-light scan and hold
 
-Normal tracking uses large command steps for a large LDR imbalance and
-one-command-unit steps near alignment. It holds both axes when their respective
-filtered LDR errors are within `+/-30` ADC counts. The four readings also pass
-through a fast first-order low-pass filter (`tau = 80 ms`), so flashlight
-changes appear quickly without letting single ADC spikes shake the panel.
+One second after startup, the tracker performs one bounded serpentine 5x5 scan
+covering the complete configured pan/tilt command range. At every grid point it
+waits 400 ms for motion and the first-order LDR low-pass filter (`tau = 80 ms`)
+to settle, then averages four sensor samples. The winning point is the one with
+the greatest total measured light across all four LDRs. The tracker returns to
+that point and changes to `mode=LIGHT-LOCK`.
 
-If an LDR error continues requesting motion after a servo reaches command `0`
-or `180` for 250 ms, the tracker stops requesting that direction and enters
-recovery. It does the same if pan feedback is trapped in the small straight-up
-singularity:
+`LIGHT-LOCK` is a strict hold: normal 20 ms sensor updates, Wi-Fi, sun-position
+updates, and ThingSpeak uploads do not write new servo commands. The firmware
+holds the chosen position for at least 30 seconds. After that, it permits one
+new full scan only when either filtered horizontal or vertical LDR difference
+has changed by at least 30 ADC counts from the locked pattern continuously for
+five seconds. A brief flashlight pass or ADC spike therefore cannot start a
+scan. Every completed rescan returns to its newly measured brightest point and
+locks again.
 
-1. At a pan limit, it first tries an over-the-top reindex: tilt to the pan axis,
-   move pan to the opposite endpoint, and mirror the tilt angle.
-2. It measures the real LDR result and keeps that pose only if its combined
-   brightness-and-balance score improves by at least 3%.
-3. If the reindex does not help, or the tilt axis is blocked, it performs a
-   nonblocking serpentine 5x5 search across the configured servo command range,
-   remembers the best measured pose, returns there, and resumes fine tracking.
-4. After returning to the best pose, it locks out repeat searches. Another
-   search is permitted only when either filtered LDR axis error changes by more
-   than 30 ADC counts, followed by the normal 250 ms limit confirmation. This
-   prevents an unreachable light source from causing continuous full-range
-   scans.
+Serial shows `mode=SCAN-*` during the bounded search, `mode=RETURN-BEST` while
+returning, and `mode=LIGHT-LOCK` when no new servo commands are being sent.
+Wi-Fi, telemetry, sensor updates, and serial output continue throughout.
 
-The Serial Monitor prints `mode=TRACK`, `mode=FLIP-*`, or `mode=SCAN-*` so the
-behavior is visible during testing. Wi-Fi, telemetry, sensor updates, and serial
-output continue while recovery is running.
-
-`TILT_AXIS_ALIGNMENT_COMMAND` in `lcd.ino` must be calibrated to the command
-where the panel normal is parallel to the bottom pan axis. `PAN_DIRECTION` and
-`TILT_DIRECTION` still select the motor wiring/mounting signs. The four LDRs
-should have a small cross-shaped opaque divider between them; without it, all
-four corners can receive nearly the same light even when the panel is not aimed
-at the source.
+The four LDRs should have a small cross-shaped opaque divider between them;
+without it, all four corners can receive nearly the same light even when the
+panel is not aimed at the source.
 
 ### Servo command range versus physical rotation
 
@@ -148,11 +133,10 @@ experimental maximum range with twice the pulse span of the original
 
 A normal three-wire servo sends no shaft-position or stall feedback to the
 ESP32. Therefore, the firmware cannot safely detect the exact instant the motor
-hits a physical stop. It now uses the entire configured 500--2500 us range and
-tries the opposite direction when the command endpoint cannot satisfy the LDRs.
-Do not expand the pulse range farther. Exact physical-stop detection requires a
-feedback servo, encoder, limit switches, or a properly designed current sensor
-and cutoff.
+hits a physical stop. It uses the entire configured 500--2500 us range during
+the bounded scan and does not command past either endpoint. Do not expand the
+pulse range farther. Exact physical-stop detection requires a feedback servo,
+encoder, limit switches, or a properly designed current sensor and cutoff.
 
 For the first powered test, support or disconnect the panel load and watch each
 servo near both endpoints. If either unit buzzes, chatters, becomes warm, or
@@ -162,6 +146,7 @@ and move that axis's `*_SERVO_MIN_PULSE_US` or `*_SERVO_MAX_PULSE_US` inward by
 of their current draw, with its ground connected to ESP32 ground.
 
 Two positional servos still cannot reach a direction outside their mechanical
-workspace. The search chooses the best reachable pose and avoids repeatedly
-requesting motion past a command endpoint; guaranteed full-azimuth coverage
-requires wider-travel positioning hardware with position feedback.
+workspace. The scan chooses the best reachable pose; guaranteed full-azimuth
+coverage requires wider-travel positioning hardware with position feedback. A
+true continuous-rotation servo cannot scan and return to an absolute angle
+without an encoder. The expected TowerPro SG90 is a positional servo.
