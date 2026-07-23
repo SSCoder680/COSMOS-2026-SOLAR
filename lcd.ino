@@ -56,6 +56,7 @@ const int TILT_SERVO_MAX_PULSE_US = 2500;
 // Command where the panel normal aligns with the bottom servo's pan axis.
 const int TILT_AXIS_ALIGNMENT_COMMAND = 90;
 const int LIGHT_DEADBAND = 30;
+const int FINE_TRACK_STEP = 1;
 const unsigned long UPDATE_INTERVAL_MS = 20;
 const unsigned long PRINT_INTERVAL_MS = 100;
 const unsigned long WIFI_RETRY_INTERVAL_MS = 15000;
@@ -105,12 +106,9 @@ const int SCAN_GRID_SIZE = 5;
 const int SCAN_POINT_COUNT = SCAN_GRID_SIZE * SCAN_GRID_SIZE;
 const int FLIP_ACCEPT_PERCENT = 3;
 
-// Scan-and-hold behavior. After a full scan, no servo commands are issued
-// until a very large directional light-pattern change persists.
+// Exactly one coarse scan runs at startup. Fine LDR tracking owns the servos
+// after the scan returns to its brightest measured pose.
 const unsigned long STARTUP_SCAN_DELAY_MS = 1000;
-const unsigned long MIN_LIGHT_POSE_HOLD_MS = 30000;
-const unsigned long RESCAN_CONFIRM_MS = 5000;
-const int RESCAN_ERROR_CHANGE = 30;
 
 Servo panServo;
 Servo tiltServo;
@@ -175,19 +173,14 @@ bool geolocationAttempted = false;
 
 bool orientationAnchorValid = false;
 bool orientationScanAttempted = false;
-bool lightPoseLocked = false;
-bool rescanTimerRunning = false;
+bool initialLightScanComplete = false;
 bool sunLockTimerRunning = false;
 bool orientationProgressInitialized = false;
 bool ldrTrackingActive = true;
 bool singularityLockReported = false;
 unsigned long sunLockStartedMs = 0;
-unsigned long lightPoseLockedMs = 0;
-unsigned long rescanRequestStartedMs = 0;
 unsigned long lastOrientationProgressMs = 0;
 int bestOrientationError = 32767;
-int lockedHorizontalError = 0;
-int lockedVerticalError = 0;
 double anchorSunAzimuthDeg = 0.0;
 double anchorSunElevationDeg = 0.0;
 int anchorPanCommand = 90;
@@ -633,13 +626,6 @@ void updateLdrReadings() {
   verticalError = bottomAdc - topAdc;
 }
 
-int movementStep(int errorSize) {
-  if (errorSize > 800) return 6;  // Large correction
-  if (errorSize > 300) return 3;  // Medium correction
-  if (errorSize > 80) return 2;   // Small correction
-  return 1;                       // Fine correction
-}
-
 int signOf(int value) {
   return (value > 0) - (value < 0);
 }
@@ -680,7 +666,7 @@ uint32_t scanLightScore() {
 }
 
 const char *trackerModeName() {
-  if (trackerMode == TRACKING && lightPoseLocked) return "LIGHT-LOCK";
+  if (trackerMode == TRACKING && initialLightScanComplete) return "LDR-TRACK";
   switch (trackerMode) {
     case TRACKING: return "TRACK";
     case FLIP_TO_ZENITH: return "FLIP-ZENITH";
@@ -745,6 +731,10 @@ void setScanTarget(int index) {
 }
 
 void beginGridScan(unsigned long now) {
+  // Hardware movement is allowed to enter this scan only before the first
+  // completed scan. This guard makes repeat full-range scans impossible.
+  if (initialLightScanComplete) return;
+
   recoveryBestPan = panAngle;
   recoveryBestTilt = tiltAngle;
   recoveryBestScore = scanLightScore();
@@ -754,18 +744,12 @@ void beginGridScan(unsigned long now) {
   Serial.println("Starting one bounded 5x5 brightest-light scan.");
 }
 
-void finishRecovery(unsigned long now) {
+void finishRecovery() {
   trackerMode = TRACKING;
   pendingLimitReason = NO_LIMIT;
   limitTimerRunning = false;
-  lightPoseLocked = true;
-  lightPoseLockedMs = now;
-  rescanTimerRunning = false;
-  lockedHorizontalError = horizontalError;
-  lockedVerticalError = verticalError;
-  recoveryHoldActive = true;
-  recoveryHoldHorizontalError = horizontalError;
-  recoveryHoldVerticalError = verticalError;
+  initialLightScanComplete = true;
+  recoveryHoldActive = false;
 
   Serial.print("Light scan complete. Brightest score/pose: ");
   Serial.print(recoveryBestScore);
@@ -773,8 +757,7 @@ void finishRecovery(unsigned long now) {
   Serial.print(panAngle);
   Serial.print('/');
   Serial.println(tiltAngle);
-  Serial.println(
-      "Servo commands are now locked; normal sensor updates cannot move them.");
+  Serial.println("One-time scan disabled. Starting fine LDR tracking.");
 }
 
 void startRecovery(LimitReason reason, unsigned long now) {
@@ -821,9 +804,9 @@ void startRecovery(LimitReason reason, unsigned long now) {
 }
 
 void beginOrientationScan(unsigned long now) {
+  if (initialLightScanComplete || trackerMode != TRACKING) return;
+
   orientationScanAttempted = true;
-  lightPoseLocked = false;
-  rescanTimerRunning = false;
   sunLockTimerRunning = false;
   orientationProgressInitialized = false;
   pendingLimitReason = NO_LIMIT;
@@ -908,6 +891,7 @@ void serviceOrientationDetection(unsigned long now) {
       bottomRight < 4095 - LDR_SATURATION_MARGIN;
   const bool stableSunLock =
       trackerMode == TRACKING &&
+      initialLightScanComplete &&
       sunPositionValid &&
       sunPosition.elevationDeg >= MIN_CALIBRATION_SUN_ELEVATION_DEG &&
       totalBrightness() >= MIN_SUN_LOCK_BRIGHTNESS &&
@@ -932,41 +916,6 @@ void serviceOrientationDetection(unsigned long now) {
     sunLockTimerRunning = false;
   }
 
-  const bool orientationAcquisitionActive =
-      !orientationAnchorValid &&
-      !orientationScanAttempted &&
-      !lightPoseLocked &&
-      trackerMode == TRACKING &&
-      sunCalibratable &&
-      totalBrightness() >= MIN_LDR_TRACKING_BRIGHTNESS;
-  if (orientationAcquisitionActive) {
-    const int currentError =
-        abs(horizontalError) + abs(verticalError);
-    if (!orientationProgressInitialized) {
-      orientationProgressInitialized = true;
-      bestOrientationError = currentError;
-      lastOrientationProgressMs = now;
-    } else if (currentError + ORIENTATION_PROGRESS_MARGIN <
-               bestOrientationError) {
-      bestOrientationError = currentError;
-      lastOrientationProgressMs = now;
-    }
-  } else if (!sunCalibratable || orientationAnchorValid) {
-    orientationProgressInitialized = false;
-  }
-
-  // Give ordinary LDR tracking time to converge. Only a persistent lack of
-  // improvement can start the single measured orientation scan.
-  if (!orientationAnchorValid &&
-      !orientationScanAttempted &&
-      !lightPoseLocked &&
-      trackerMode == TRACKING &&
-      sunCalibratable &&
-      orientationProgressInitialized &&
-      now - sunBecameCalibratableMs >= PASSIVE_SUN_LOCK_WAIT_MS &&
-      now - lastOrientationProgressMs >= ORIENTATION_NO_PROGRESS_MS) {
-    beginOrientationScan(now);
-  }
 }
 
 void serviceSunGuidance(unsigned long now) {
@@ -1026,36 +975,44 @@ void serviceSunGuidance(unsigned long now) {
   lastSunGuidanceStepMs = now;
 }
 
-void serviceLightPoseLock(unsigned long now) {
-  if (!lightPoseLocked ||
-      !ldrTrackingActive ||
-      now - lightPoseLockedMs < MIN_LIGHT_POSE_HOLD_MS) {
-    rescanTimerRunning = false;
-    return;
+void serviceLdrFineTracking() {
+  if (!initialLightScanComplete || !ldrTrackingActive) return;
+
+  int requestedPanDelta = 0;
+  int requestedTiltDelta = 0;
+
+  // A positive horizontal error means the right pair has the lower ADC
+  // (brighter light). A positive vertical error means the top pair is brighter.
+  if (abs(horizontalError) > LIGHT_DEADBAND) {
+    requestedPanDelta =
+        signOf(horizontalError) *
+        effectivePanDirection() *
+        FINE_TRACK_STEP;
+  }
+  if (abs(verticalError) > LIGHT_DEADBAND) {
+    requestedTiltDelta =
+        signOf(verticalError) *
+        TILT_DIRECTION *
+        FINE_TRACK_STEP;
   }
 
-  const bool patternChanged =
-      abs(horizontalError - lockedHorizontalError) >= RESCAN_ERROR_CHANGE ||
-      abs(verticalError - lockedVerticalError) >= RESCAN_ERROR_CHANGE;
-  if (!patternChanged) {
-    rescanTimerRunning = false;
-    return;
+  const int nextPan = constrain(
+      panAngle + requestedPanDelta,
+      PAN_MIN_COMMAND,
+      PAN_MAX_COMMAND);
+  const int nextTilt = constrain(
+      tiltAngle + requestedTiltDelta,
+      TILT_MIN_COMMAND,
+      TILT_MAX_COMMAND);
+
+  if (nextPan != panAngle) {
+    panAngle = nextPan;
+    panServo.write(panAngle);
   }
-
-  if (!rescanTimerRunning) {
-    rescanTimerRunning = true;
-    rescanRequestStartedMs = now;
-    return;
+  if (nextTilt != tiltAngle) {
+    tiltAngle = nextTilt;
+    tiltServo.write(tiltAngle);
   }
-
-  if (now - rescanRequestStartedMs < RESCAN_CONFIRM_MS) return;
-
-  Serial.println(
-      "Large sustained light-direction change detected: rescanning once.");
-  lightPoseLocked = false;
-  orientationAnchorValid = false;
-  orientationScanAttempted = false;
-  beginOrientationScan(now);
 }
 
 void updateLimitRequest(LimitReason reason, unsigned long now) {
@@ -1228,7 +1185,7 @@ void serviceRecovery(unsigned long now) {
 
     case FINAL_SETTLE:
       if (now - recoveryStateStartedMs >= FINAL_SETTLE_MS) {
-        finishRecovery(now);
+        finishRecovery();
       }
       return;
   }
@@ -1439,15 +1396,14 @@ void setup() {
   panServo.write(panAngle);
   tiltServo.write(tiltAngle);
 
-  Serial.println("Four-LDR brightest-light scan-and-hold tracker started.");
+  Serial.println("Four-LDR scan-then-track solar tracker started.");
   Serial.println("Lower ADC value is treated as brighter.");
   Serial.print("LDR balance deadband: +/-");
   Serial.print(LIGHT_DEADBAND);
   Serial.println(" ADC counts.");
   Serial.println(
-      "One full-range scan starts after 1 second, then mode=LIGHT-LOCK.");
-  Serial.println(
-      "A new scan requires a >=30 ADC pattern change sustained for 5 seconds.");
+      "One full-range scan starts after 1 second, then mode=LDR-TRACK.");
+  Serial.println("The full-range scan cannot run again until reboot.");
 }
 
 void loop() {
@@ -1469,12 +1425,11 @@ void loop() {
 
     if (trackerMode != TRACKING) {
       serviceRecovery(now);
-    } else if (lightPoseLocked) {
-      // Strict hold: this path never writes either servo.
-      serviceLightPoseLock(now);
-    } else if (!orientationScanAttempted &&
+    } else if (!initialLightScanComplete &&
                now >= STARTUP_SCAN_DELAY_MS) {
       beginOrientationScan(now);
+    } else if (initialLightScanComplete) {
+      serviceLdrFineTracking();
     }
   }
 

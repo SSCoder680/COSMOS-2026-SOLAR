@@ -74,15 +74,14 @@ be used for safety-critical positioning.
 
 The firmware applies NOAA's compact solar equations every 30 seconds to
 calculate geometric sun azimuth and elevation from true north. This estimate is
-reported to Serial and ThingSpeak, but it never overrides the strict
-brightest-light hold described below.
+reported to Serial and ThingSpeak, but it does not start another full-range
+scan or override the LDR fine tracker described below.
 
 When both LDR errors remain within `+/-30` under strong light for two seconds,
-the firmware can associate the held panel pose with the calculated sun
+the firmware can associate the tracked panel pose with the calculated sun
 azimuth/elevation. That creates an approximate local direction anchor for
-telemetry. A coarse brightest-light pose is not guaranteed to be balanced
-within `+/-30`, so Serial may continue to show `panel direction=acquiring`; this
-does not prevent the panel from remaining locked at the best measured pose.
+telemetry. Serial may show `panel direction=acquiring` until fine tracking has
+balanced the four sensors.
 
 This is the strongest automatic direction estimate possible with the existing
 four LDRs and three-wire SG90 servos. The ESP32 has no compass, accelerometer,
@@ -97,27 +96,27 @@ References: [NOAA solar-position equations](https://gml.noaa.gov/grad/solcalc/so
 [Espressif system-time/SNTP documentation](https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/system_time.html),
 and [ipwho.is geolocation API documentation](https://ipwhois.io/documentation).
 
-## Brightest-light scan and hold
+## One scan, then LDR fine tracking
 
 One second after startup, the tracker performs one bounded serpentine 5x5 scan
 covering the complete configured pan/tilt command range. At every grid point it
 waits 400 ms for motion and the first-order LDR low-pass filter (`tau = 80 ms`)
 to settle, then averages four sensor samples. The winning point is the one with
 the greatest total measured light across all four LDRs. The tracker returns to
-that point and changes to `mode=LIGHT-LOCK`.
+that point and changes permanently to `mode=LDR-TRACK` for the rest of that
+boot. The full-range scan cannot run again until the ESP32 is restarted.
 
-`LIGHT-LOCK` is a strict hold: normal 20 ms sensor updates, Wi-Fi, sun-position
-updates, and ThingSpeak uploads do not write new servo commands. The firmware
-holds the chosen position for at least 30 seconds. After that, it permits one
-new full scan only when either filtered horizontal or vertical LDR difference
-has changed by at least 30 ADC counts from the locked pattern continuously for
-five seconds. A brief flashlight pass or ADC spike therefore cannot start a
-scan. Every completed rescan returns to its newly measured brightest point and
-locks again.
+In `LDR-TRACK`, the two left readings are compared with the two right readings
+for pan, and the two top readings are compared with the two bottom readings for
+tilt. Because lower ADC means brighter with this wiring, each axis moves one
+command unit every 20 ms toward the lower-ADC pair. An axis stops when its
+difference is within `+/-30` ADC counts. Weak light also pauses motion using the
+existing brightness hysteresis, and reaching command `0` or `180` holds that
+axis rather than launching recovery or another scan.
 
 Serial shows `mode=SCAN-*` during the bounded search, `mode=RETURN-BEST` while
-returning, and `mode=LIGHT-LOCK` when no new servo commands are being sent.
-Wi-Fi, telemetry, sensor updates, and serial output continue throughout.
+returning, and `mode=LDR-TRACK` during fine correction. Wi-Fi, telemetry,
+sensor updates, and serial output continue throughout.
 
 The four LDRs should have a small cross-shaped opaque divider between them;
 without it, all four corners can receive nearly the same light even when the
