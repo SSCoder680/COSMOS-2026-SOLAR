@@ -11,7 +11,8 @@ Install these libraries through **Arduino IDE > Library Manager**:
 - `ThingSpeak` by MathWorks
 
 Select **ESP32 Wrover Module** as the board and use a 115200 baud Serial
-Monitor.
+Monitor. Wi-Fi, HTTPS, NTP time, and Preferences storage come with the ESP32
+board package; they do not require additional Library Manager downloads.
 
 ## Wi-Fi and ThingSpeak credentials
 
@@ -22,6 +23,8 @@ Edit the local `secrets.h` file:
 #define SECRET_PASS ""
 #define SECRET_CH_ID 1234567UL
 #define SECRET_WRITE_APIKEY "your-channel-write-api-key"
+#define SECRET_LATITUDE 999.0
+#define SECRET_LONGITUDE 999.0
 ```
 
 Leave `SECRET_PASS` empty for an open guest network. If the guest network opens
@@ -32,6 +35,10 @@ The channel ID is a number without quotation marks. Find the Write API key on
 the ThingSpeak channel's **API Keys** tab. `secrets.h` is ignored by Git so the
 password and key are not uploaded. `secrets.example.h` is the safe template.
 
+Leave both coordinates at `999.0` for automatic public-IP geolocation. Enter
+real latitude/longitude only when a more accurate fixed location is needed
+(north/east positive, south/west negative).
+
 Configure the ThingSpeak channel fields as follows:
 
 1. Top-left LDR raw ADC
@@ -40,11 +47,59 @@ Configure the ThingSpeak channel fields as follows:
 4. Bottom-right LDR raw ADC
 5. Pan servo command
 6. Tilt servo command
+7. Estimated sun azimuth in degrees (`0` north, `90` east)
+8. Estimated sun elevation in degrees (`0` horizon, `90` overhead)
 
 Lower LDR ADC values mean brighter light with the documented voltage-divider
 wiring. The ESP32 tracks locally every 20 ms, prints readings every 100 ms,
-reconnects to Wi-Fi automatically, and uploads all six fields every 20 seconds.
-A successful ThingSpeak upload prints status code `200` in the Serial Monitor.
+reconnects to Wi-Fi automatically, and uploads all eight fields every 20
+seconds. Geolocation and ThingSpeak requests run in background tasks, so a slow
+guest network does not pause the 20 ms servo loop. A successful ThingSpeak
+upload prints status code `200` in the Serial Monitor.
+
+## Automatic time, location, and direction
+
+After Wi-Fi connects, the ESP32 synchronizes UTC from NTP, so the hour, day,
+month, and year require no manual entry. It requests an approximate
+latitude/longitude once from `ipwho.is` using the network's public IP and caches
+the result in ESP32 Preferences. A failed request is retried after 10 minutes,
+not every few seconds. Public-IP coordinates can identify an ISP, VPN endpoint,
+or nearby population center rather than the exact panel, so use the optional
+coordinates in `secrets.h` when accuracy matters.
+
+For prototype portability, the ESP32 HTTPS client does not pin the
+geolocation service's certificate. The response is strictly limited and parsed
+as a short coordinate pair, but it is still a best-effort estimate and must not
+be used for safety-critical positioning.
+
+The firmware applies NOAA's compact solar equations every 30 seconds to
+calculate geometric sun azimuth and elevation from true north. When the sun is
+at least 5 degrees above the horizon, it first gives normal LDR tracking at
+least five seconds to align and keeps waiting while the LDR error is improving.
+Only three seconds of persistent non-improvement can start one measured 5x5
+orientation scan for that boot; it does not repeat this startup scan
+continuously.
+
+When both LDR errors remain within `+/-30` under strong light for two seconds,
+the panel is considered locked to the sun. At that instant its detected
+absolute direction is the calculated sun azimuth/elevation. That lock also
+anchors the local servo geometry. If direct light later becomes too weak for
+the LDRs, the sun estimate may make small corrections of at most 20 degrees
+from the latest measured anchor; direct-light LDR readings immediately take
+control again.
+
+This is the strongest automatic direction estimate possible with the existing
+four LDRs and three-wire SG90 servos. The ESP32 has no compass, accelerometer,
+GPS, servo encoder, or shaft feedback. Therefore it cannot instantly determine
+true north, arbitrary base tilt, or exact physical servo angle before seeing
+the sun. Reflections, indoor lamps, clouds, or moving the base can also create
+a false/stale anchor. True placement-independent 3-D direction requires a
+calibrated accelerometer/magnetometer (or 9-axis IMU); exact device location
+requires GNSS.
+
+References: [NOAA solar-position equations](https://gml.noaa.gov/grad/solcalc/solareqns.PDF),
+[Espressif system-time/SNTP documentation](https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/system_time.html),
+and [ipwho.is geolocation API documentation](https://ipwhois.io/documentation).
 
 ## Automatic joint-limit recovery
 

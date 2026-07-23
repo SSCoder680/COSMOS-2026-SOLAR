@@ -1,9 +1,23 @@
 #include <Arduino.h>
 #include <ESP32Servo.h>
+#include <HTTPClient.h>
+#include <Preferences.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <math.h>
+#include <time.h>
 
 #include "secrets.h"
 #include <ThingSpeak.h>
+
+// Optional exact coordinates. If these are not present in secrets.h, the
+// firmware estimates location from the Wi-Fi network's public IP address.
+#ifndef SECRET_LATITUDE
+#define SECRET_LATITUDE 999.0
+#endif
+#ifndef SECRET_LONGITUDE
+#define SECRET_LONGITUDE 999.0
+#endif
 
 // ---------------- Pins ----------------
 
@@ -47,6 +61,31 @@ const unsigned long PRINT_INTERVAL_MS = 100;
 const unsigned long WIFI_RETRY_INTERVAL_MS = 15000;
 const unsigned long THINGSPEAK_UPLOAD_INTERVAL_MS = 20000;
 
+// Automatic time, location, and solar feed-forward settings.
+const char NTP_SERVER_1[] = "pool.ntp.org";
+const char NTP_SERVER_2[] = "time.nist.gov";
+const char GEOLOCATION_URL[] =
+    "https://ipwho.is/?fields=latitude,longitude&output=csv";
+const unsigned long GEOLOCATION_RETRY_INTERVAL_MS = 10UL * 60UL * 1000UL;
+const unsigned long SUN_UPDATE_INTERVAL_MS = 30000;
+const unsigned long SUN_LOCK_CONFIRM_MS = 2000;
+const unsigned long PASSIVE_SUN_LOCK_WAIT_MS = 5000;
+const unsigned long ORIENTATION_NO_PROGRESS_MS = 3000;
+const unsigned long SUN_GUIDANCE_STEP_INTERVAL_MS = 100;
+const int MIN_LDR_TRACKING_BRIGHTNESS = 800;
+const int LDR_TRACKING_ENTER_BRIGHTNESS = 1000;
+const int LDR_TRACKING_EXIT_BRIGHTNESS = 600;
+const int MIN_SUN_LOCK_BRIGHTNESS = 4000;
+const int MIN_SUN_LOCK_SCORE = 1000;
+const int ORIENTATION_PROGRESS_MARGIN = 20;
+const int LDR_SATURATION_MARGIN = 20;
+const float MIN_CALIBRATION_SUN_ELEVATION_DEG = 5.0f;
+const float MAX_GUIDANCE_SUN_ELEVATION_DEG = 85.0f;
+const float MAX_ANCHOR_GUIDANCE_CHANGE_DEG = 20.0f;
+const float PAN_DEGREES_PER_COMMAND = 1.0f;
+const float TILT_DEGREES_PER_COMMAND = 1.0f;
+const double UNSET_COORDINATE = 999.0;
+
 // H(s) = 1 / (tau*s + 1), discretized as an exponential moving average.
 // At a 20 ms sample interval, tau=80 ms gives alpha=0.20: quick, but much
 // less sensitive to ADC noise than one unfiltered conversion.
@@ -69,6 +108,80 @@ const int FLIP_ACCEPT_PERCENT = 3;
 Servo panServo;
 Servo tiltServo;
 WiFiClient thingSpeakClient;
+Preferences solarPreferences;
+
+struct SunPosition {
+  double azimuthDeg;
+  double elevationDeg;
+  bool aboveHorizon;
+};
+
+struct GeolocationResult {
+  bool taskRunning;
+  bool resultReady;
+  bool succeeded;
+  double latitudeDeg;
+  double longitudeDeg;
+};
+
+struct ThingSpeakSnapshot {
+  int ldrTopLeft;
+  int ldrTopRight;
+  int ldrBottomLeft;
+  int ldrBottomRight;
+  int panCommand;
+  int tiltCommand;
+  bool sunValid;
+  float sunAzimuthDeg;
+  float sunElevationDeg;
+};
+
+struct ThingSpeakTaskState {
+  bool taskRunning;
+  bool resultReady;
+  int statusCode;
+  ThingSpeakSnapshot snapshot;
+};
+
+portMUX_TYPE geolocationMux = portMUX_INITIALIZER_UNLOCKED;
+GeolocationResult geolocationResult = {false, false, false, 0.0, 0.0};
+portMUX_TYPE thingSpeakMux = portMUX_INITIALIZER_UNLOCKED;
+ThingSpeakTaskState thingSpeakTaskState = {
+    false, false, 0, {0, 0, 0, 0, 90, 90, false, 0.0f, 0.0f}};
+
+double latitudeDeg = 0.0;
+double longitudeDeg = 0.0;
+bool locationValid = false;
+bool locationIsManual = false;
+bool automaticLocationResolved = false;
+String locationSource = "none";
+
+bool ntpStarted = false;
+bool timeValid = false;
+bool sunPositionValid = false;
+bool sunCalibratable = false;
+SunPosition sunPosition = {0.0, -90.0, false};
+unsigned long sunBecameCalibratableMs = 0;
+unsigned long lastSunUpdateMs = 0;
+unsigned long lastGeolocationAttemptMs = 0;
+bool geolocationAttempted = false;
+
+bool orientationAnchorValid = false;
+bool orientationScanAttempted = false;
+bool sunLockTimerRunning = false;
+bool orientationProgressInitialized = false;
+bool ldrTrackingActive = true;
+bool singularityLockReported = false;
+unsigned long sunLockStartedMs = 0;
+unsigned long lastOrientationProgressMs = 0;
+int bestOrientationError = 32767;
+double anchorSunAzimuthDeg = 0.0;
+double anchorSunElevationDeg = 0.0;
+int anchorPanCommand = 90;
+int anchorTiltCommand = 90;
+int anchorPanParity = 0;
+unsigned long lastOrientationAnchorMs = 0;
+unsigned long lastSunGuidanceStepMs = 0;
 
 int panAngle = 90;
 int tiltAngle = 90;
@@ -138,6 +251,325 @@ uint32_t recoverySampleTotal = 0;
 int recoverySampleCount = 0;
 int scanPointIndex = 0;
 unsigned long recoveryStateStartedMs = 0;
+
+bool coordinatesValid(double latitude, double longitude) {
+  return isfinite(latitude) && isfinite(longitude) &&
+         latitude >= -90.0 && latitude <= 90.0 &&
+         longitude >= -180.0 && longitude <= 180.0;
+}
+
+double wrapDegrees(double angle) {
+  angle = fmod(angle, 360.0);
+  return angle < 0.0 ? angle + 360.0 : angle;
+}
+
+double shortestAngleDifference(double target, double origin) {
+  double difference = wrapDegrees(target - origin + 180.0) - 180.0;
+  return difference <= -180.0 ? difference + 360.0 : difference;
+}
+
+bool isLeapYear(int year) {
+  return (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+}
+
+bool estimateSunPosition(
+    time_t utcEpoch,
+    double latitude,
+    double longitudeEast,
+    SunPosition &result) {
+  struct tm utc;
+  if (gmtime_r(&utcEpoch, &utc) == nullptr) return false;
+
+  const double pi = 3.14159265358979323846;
+  const double degreesToRadians = pi / 180.0;
+  const double radiansToDegrees = 180.0 / pi;
+  const int year = utc.tm_year + 1900;
+  const int daysInYear = isLeapYear(year) ? 366 : 365;
+  const double utcMinutes =
+      utc.tm_hour * 60.0 + utc.tm_min + utc.tm_sec / 60.0;
+  const double utcHour = utcMinutes / 60.0;
+
+  // NOAA fractional-year approximation. tm_yday is already zero-based.
+  const double gamma =
+      2.0 * pi / daysInYear *
+      (utc.tm_yday + (utcHour - 12.0) / 24.0);
+  const double equationOfTimeMinutes =
+      229.18 *
+      (0.000075 +
+       0.001868 * cos(gamma) -
+       0.032077 * sin(gamma) -
+       0.014615 * cos(2.0 * gamma) -
+       0.040849 * sin(2.0 * gamma));
+  const double declination =
+      0.006918 -
+      0.399912 * cos(gamma) +
+      0.070257 * sin(gamma) -
+      0.006758 * cos(2.0 * gamma) +
+      0.000907 * sin(2.0 * gamma) -
+      0.002697 * cos(3.0 * gamma) +
+      0.001480 * sin(3.0 * gamma);
+
+  double trueSolarMinutes =
+      fmod(utcMinutes + equationOfTimeMinutes + 4.0 * longitudeEast, 1440.0);
+  if (trueSolarMinutes < 0.0) trueSolarMinutes += 1440.0;
+
+  const double hourAngle =
+      (trueSolarMinutes / 4.0 - 180.0) * degreesToRadians;
+  const double latitudeRadians = latitude * degreesToRadians;
+  double sinElevation =
+      sin(latitudeRadians) * sin(declination) +
+      cos(latitudeRadians) * cos(declination) * cos(hourAngle);
+  sinElevation = max(-1.0, min(1.0, sinElevation));
+
+  const double elevation = asin(sinElevation);
+  const double azimuthY = sin(hourAngle);
+  const double azimuthX =
+      cos(hourAngle) * sin(latitudeRadians) -
+      tan(declination) * cos(latitudeRadians);
+
+  result.elevationDeg = elevation * radiansToDegrees;
+  result.azimuthDeg = wrapDegrees(
+      atan2(azimuthY, azimuthX) * radiansToDegrees + 180.0);
+  result.aboveHorizon = result.elevationDeg > 0.0;
+  return true;
+}
+
+void applyLocation(
+    double latitude,
+    double longitude,
+    const char *source,
+    bool persist) {
+  if (!coordinatesValid(latitude, longitude)) return;
+
+  const bool locationChangedMaterially =
+      locationValid &&
+      (fabs(latitude - latitudeDeg) > 0.01 ||
+       fabs(longitude - longitudeDeg) > 0.01);
+
+  latitudeDeg = latitude;
+  longitudeDeg = longitude;
+  locationValid = true;
+  locationSource = source;
+  sunPositionValid = false;
+  sunCalibratable = false;
+
+  if (locationChangedMaterially) {
+    orientationAnchorValid = false;
+    orientationScanAttempted = false;
+    sunLockTimerRunning = false;
+    orientationProgressInitialized = false;
+    Serial.println(
+        "Location changed: clearing the previous sun orientation anchor.");
+  }
+
+  if (persist) {
+    solarPreferences.putDouble("latitude", latitude);
+    solarPreferences.putDouble("longitude", longitude);
+    solarPreferences.putBool("locationValid", true);
+  }
+
+  Serial.print("Location ready [");
+  Serial.print(source);
+  Serial.print("]: ");
+  Serial.print(latitudeDeg, 5);
+  Serial.print(", ");
+  Serial.println(longitudeDeg, 5);
+}
+
+void loadLocationConfiguration() {
+  const double configuredLatitude = (double)SECRET_LATITUDE;
+  const double configuredLongitude = (double)SECRET_LONGITUDE;
+  if (configuredLatitude != UNSET_COORDINATE &&
+      configuredLongitude != UNSET_COORDINATE &&
+      coordinatesValid(configuredLatitude, configuredLongitude)) {
+    locationIsManual = true;
+    automaticLocationResolved = true;
+    applyLocation(
+        configuredLatitude, configuredLongitude, "secrets.h exact", false);
+    return;
+  }
+
+  if (solarPreferences.getBool("locationValid", false)) {
+    const double cachedLatitude = solarPreferences.getDouble("latitude", 0.0);
+    const double cachedLongitude = solarPreferences.getDouble("longitude", 0.0);
+    if (coordinatesValid(cachedLatitude, cachedLongitude)) {
+      applyLocation(cachedLatitude, cachedLongitude, "cached IP estimate", false);
+    }
+  }
+}
+
+void geolocationTask(void *parameter) {
+  bool succeeded = false;
+  double latitude = 0.0;
+  double longitude = 0.0;
+
+  if (WiFi.status() == WL_CONNECTED) {
+    WiFiClientSecure secureClient;
+    secureClient.setInsecure();
+
+    HTTPClient http;
+    http.setConnectTimeout(5000);
+    http.setTimeout(5000);
+    http.setUserAgent("COSMOS-ESP32-Solar-Tracker/1.0");
+
+    if (http.begin(secureClient, GEOLOCATION_URL)) {
+      const int statusCode = http.GET();
+      const int contentLength = http.getSize();
+      if (statusCode == HTTP_CODE_OK &&
+          contentLength > 0 &&
+          contentLength <= 64) {
+        String body = http.getString();
+        body.trim();
+        const char *latitudeStart = body.c_str();
+        char *latitudeEnd = nullptr;
+        const double parsedLatitude =
+            strtod(latitudeStart, &latitudeEnd);
+        if (latitudeEnd != latitudeStart &&
+            latitudeEnd != nullptr &&
+            *latitudeEnd == ',') {
+          const char *longitudeStart = latitudeEnd + 1;
+          char *longitudeEnd = nullptr;
+          const double parsedLongitude =
+              strtod(longitudeStart, &longitudeEnd);
+          latitude = parsedLatitude;
+          longitude = parsedLongitude;
+          succeeded =
+              longitudeEnd != longitudeStart &&
+              *longitudeEnd == '\0' &&
+              coordinatesValid(latitude, longitude);
+        }
+      }
+      http.end();
+    }
+  }
+
+  portENTER_CRITICAL(&geolocationMux);
+  geolocationResult.succeeded = succeeded;
+  geolocationResult.latitudeDeg = latitude;
+  geolocationResult.longitudeDeg = longitude;
+  geolocationResult.resultReady = true;
+  geolocationResult.taskRunning = false;
+  portEXIT_CRITICAL(&geolocationMux);
+
+  vTaskDelete(nullptr);
+}
+
+bool geolocationTaskIsRunning() {
+  portENTER_CRITICAL(&geolocationMux);
+  const bool running = geolocationResult.taskRunning;
+  portEXIT_CRITICAL(&geolocationMux);
+  return running;
+}
+
+bool startGeolocationTask(unsigned long now) {
+  portENTER_CRITICAL(&geolocationMux);
+  if (geolocationResult.taskRunning) {
+    portEXIT_CRITICAL(&geolocationMux);
+    return false;
+  }
+  geolocationResult.taskRunning = true;
+  geolocationResult.resultReady = false;
+  portEXIT_CRITICAL(&geolocationMux);
+
+  geolocationAttempted = true;
+  lastGeolocationAttemptMs = now;
+  const BaseType_t created = xTaskCreatePinnedToCore(
+      geolocationTask,
+      "ip-geolocation",
+      8192,
+      nullptr,
+      1,
+      nullptr,
+      0);
+  if (created != pdPASS) {
+    portENTER_CRITICAL(&geolocationMux);
+    geolocationResult.taskRunning = false;
+    portEXIT_CRITICAL(&geolocationMux);
+    Serial.println("Could not start the background geolocation task.");
+    return false;
+  }
+
+  Serial.println("Estimating location from public IP in the background...");
+  return true;
+}
+
+void thingSpeakUploadTask(void *parameter) {
+  ThingSpeakSnapshot snapshot;
+  portENTER_CRITICAL(&thingSpeakMux);
+  snapshot = thingSpeakTaskState.snapshot;
+  portEXIT_CRITICAL(&thingSpeakMux);
+
+  ThingSpeak.setField(1, snapshot.ldrTopLeft);
+  ThingSpeak.setField(2, snapshot.ldrTopRight);
+  ThingSpeak.setField(3, snapshot.ldrBottomLeft);
+  ThingSpeak.setField(4, snapshot.ldrBottomRight);
+  ThingSpeak.setField(5, snapshot.panCommand);
+  ThingSpeak.setField(6, snapshot.tiltCommand);
+  if (snapshot.sunValid) {
+    ThingSpeak.setField(7, snapshot.sunAzimuthDeg);
+    ThingSpeak.setField(8, snapshot.sunElevationDeg);
+  }
+
+  const int statusCode =
+      ThingSpeak.writeFields(SECRET_CH_ID, SECRET_WRITE_APIKEY);
+
+  portENTER_CRITICAL(&thingSpeakMux);
+  thingSpeakTaskState.statusCode = statusCode;
+  thingSpeakTaskState.resultReady = true;
+  thingSpeakTaskState.taskRunning = false;
+  portEXIT_CRITICAL(&thingSpeakMux);
+
+  vTaskDelete(nullptr);
+}
+
+bool thingSpeakTaskIsRunning() {
+  portENTER_CRITICAL(&thingSpeakMux);
+  const bool running = thingSpeakTaskState.taskRunning;
+  portEXIT_CRITICAL(&thingSpeakMux);
+  return running;
+}
+
+bool startThingSpeakUploadTask(unsigned long now) {
+  portENTER_CRITICAL(&thingSpeakMux);
+  if (thingSpeakTaskState.taskRunning) {
+    portEXIT_CRITICAL(&thingSpeakMux);
+    return false;
+  }
+
+  thingSpeakTaskState.snapshot.ldrTopLeft = topLeft;
+  thingSpeakTaskState.snapshot.ldrTopRight = topRight;
+  thingSpeakTaskState.snapshot.ldrBottomLeft = bottomLeft;
+  thingSpeakTaskState.snapshot.ldrBottomRight = bottomRight;
+  thingSpeakTaskState.snapshot.panCommand = panAngle;
+  thingSpeakTaskState.snapshot.tiltCommand = tiltAngle;
+  thingSpeakTaskState.snapshot.sunValid = sunPositionValid;
+  thingSpeakTaskState.snapshot.sunAzimuthDeg =
+      (float)sunPosition.azimuthDeg;
+  thingSpeakTaskState.snapshot.sunElevationDeg =
+      (float)sunPosition.elevationDeg;
+  thingSpeakTaskState.taskRunning = true;
+  thingSpeakTaskState.resultReady = false;
+  portEXIT_CRITICAL(&thingSpeakMux);
+
+  lastThingSpeakUploadMs = now;
+  thingSpeakUploadAttempted = true;
+  const BaseType_t created = xTaskCreatePinnedToCore(
+      thingSpeakUploadTask,
+      "thingspeak-upload",
+      8192,
+      nullptr,
+      1,
+      nullptr,
+      0);
+  if (created != pdPASS) {
+    portENTER_CRITICAL(&thingSpeakMux);
+    thingSpeakTaskState.taskRunning = false;
+    portEXIT_CRITICAL(&thingSpeakMux);
+    Serial.println("Could not start the background ThingSpeak task.");
+    return false;
+  }
+  return true;
+}
 
 int readLdrRaw(int pin) {
   // Discard the first conversion after changing ADC channels.
@@ -320,6 +752,14 @@ void finishRecovery() {
 }
 
 void startRecovery(LimitReason reason, unsigned long now) {
+  if (orientationAnchorValid) {
+    orientationAnchorValid = false;
+    sunLockTimerRunning = false;
+    orientationProgressInitialized = false;
+    Serial.println(
+        "Recovery changed servo geometry: clearing the sun anchor.");
+  }
+
   pendingLimitReason = reason;
   recoveryOriginPan = panAngle;
   recoveryOriginTilt = tiltAngle;
@@ -354,18 +794,233 @@ void startRecovery(LimitReason reason, unsigned long now) {
   beginGridScan(now);
 }
 
+void beginOrientationScan(unsigned long now) {
+  orientationScanAttempted = true;
+  sunLockTimerRunning = false;
+  orientationProgressInitialized = false;
+  pendingLimitReason = NO_LIMIT;
+  limitTimerRunning = false;
+  recoveryHoldActive = false;
+  recoveryOriginPan = panAngle;
+  recoveryOriginTilt = tiltAngle;
+  recoveryOriginScore = opticalScore();
+  recoveryBestPan = panAngle;
+  recoveryBestTilt = tiltAngle;
+  recoveryBestScore = recoveryOriginScore;
+
+  Serial.println(
+      "Sun is above the horizon: starting one automatic orientation scan.");
+  beginGridScan(now);
+}
+
+void captureOrientationAnchor(unsigned long now) {
+  const int panParity = effectivePanDirection();
+  if (panParity == 0) {
+    orientationScanAttempted = true;
+    if (!singularityLockReported) {
+      Serial.println(
+          "Sun lock is near zenith; elevation is known but azimuth anchoring "
+          "waits until the panel leaves the pan singularity.");
+      singularityLockReported = true;
+    }
+    return;
+  }
+
+  anchorSunAzimuthDeg = sunPosition.azimuthDeg;
+  anchorSunElevationDeg = sunPosition.elevationDeg;
+  anchorPanCommand = panAngle;
+  anchorTiltCommand = tiltAngle;
+  anchorPanParity = panParity;
+  orientationAnchorValid = true;
+  orientationScanAttempted = true;
+  singularityLockReported = false;
+  lastOrientationAnchorMs = now;
+
+  Serial.print("Panel direction detected from stable sun lock: az/el=");
+  Serial.print(anchorSunAzimuthDeg, 1);
+  Serial.print('/');
+  Serial.print(anchorSunElevationDeg, 1);
+  Serial.print(" deg at command ");
+  Serial.print(anchorPanCommand);
+  Serial.print('/');
+  Serial.println(anchorTiltCommand);
+}
+
+bool estimatePanelDirection(double &azimuth, double &elevation) {
+  if (!orientationAnchorValid) return false;
+
+  if (panAngle == anchorPanCommand && tiltAngle == anchorTiltCommand) {
+    azimuth = anchorSunAzimuthDeg;
+    elevation = anchorSunElevationDeg;
+    return true;
+  }
+
+  const int currentPanParity = effectivePanDirection();
+  if (anchorPanParity == 0 || currentPanParity != anchorPanParity) return false;
+
+  azimuth = wrapDegrees(
+      anchorSunAzimuthDeg +
+      (panAngle - anchorPanCommand) *
+          anchorPanParity * PAN_DEGREES_PER_COMMAND);
+  elevation =
+      anchorSunElevationDeg +
+      (tiltAngle - anchorTiltCommand) *
+          TILT_DIRECTION * TILT_DEGREES_PER_COMMAND;
+  return elevation >= -90.0 && elevation <= 90.0;
+}
+
+void serviceOrientationDetection(unsigned long now) {
+  const bool sensorsNotSaturated =
+      topLeft > LDR_SATURATION_MARGIN &&
+      topRight > LDR_SATURATION_MARGIN &&
+      bottomLeft > LDR_SATURATION_MARGIN &&
+      bottomRight > LDR_SATURATION_MARGIN &&
+      topLeft < 4095 - LDR_SATURATION_MARGIN &&
+      topRight < 4095 - LDR_SATURATION_MARGIN &&
+      bottomLeft < 4095 - LDR_SATURATION_MARGIN &&
+      bottomRight < 4095 - LDR_SATURATION_MARGIN;
+  const bool stableSunLock =
+      trackerMode == TRACKING &&
+      sunPositionValid &&
+      sunPosition.elevationDeg >= MIN_CALIBRATION_SUN_ELEVATION_DEG &&
+      totalBrightness() >= MIN_SUN_LOCK_BRIGHTNESS &&
+      opticalScore() >= MIN_SUN_LOCK_SCORE &&
+      sensorsNotSaturated &&
+      abs(horizontalError) <= LIGHT_DEADBAND &&
+      abs(verticalError) <= LIGHT_DEADBAND;
+
+  if (stableSunLock) {
+    if (!sunLockTimerRunning) {
+      sunLockTimerRunning = true;
+      sunLockStartedMs = now;
+    } else if (now - sunLockStartedMs >= SUN_LOCK_CONFIRM_MS &&
+               (!orientationAnchorValid ||
+                now - lastOrientationAnchorMs >= SUN_UPDATE_INTERVAL_MS ||
+                abs(panAngle - anchorPanCommand) >= 2 ||
+                abs(tiltAngle - anchorTiltCommand) >= 2)) {
+      captureOrientationAnchor(now);
+      sunLockStartedMs = now;
+    }
+  } else {
+    sunLockTimerRunning = false;
+  }
+
+  const bool orientationAcquisitionActive =
+      !orientationAnchorValid &&
+      !orientationScanAttempted &&
+      trackerMode == TRACKING &&
+      sunCalibratable &&
+      totalBrightness() >= MIN_LDR_TRACKING_BRIGHTNESS;
+  if (orientationAcquisitionActive) {
+    const int currentError =
+        abs(horizontalError) + abs(verticalError);
+    if (!orientationProgressInitialized) {
+      orientationProgressInitialized = true;
+      bestOrientationError = currentError;
+      lastOrientationProgressMs = now;
+    } else if (currentError + ORIENTATION_PROGRESS_MARGIN <
+               bestOrientationError) {
+      bestOrientationError = currentError;
+      lastOrientationProgressMs = now;
+    }
+  } else if (!sunCalibratable || orientationAnchorValid) {
+    orientationProgressInitialized = false;
+  }
+
+  // Give ordinary LDR tracking time to converge. Only a persistent lack of
+  // improvement can start the single measured orientation scan.
+  if (!orientationAnchorValid &&
+      !orientationScanAttempted &&
+      trackerMode == TRACKING &&
+      sunCalibratable &&
+      orientationProgressInitialized &&
+      now - sunBecameCalibratableMs >= PASSIVE_SUN_LOCK_WAIT_MS &&
+      now - lastOrientationProgressMs >= ORIENTATION_NO_PROGRESS_MS) {
+    beginOrientationScan(now);
+  }
+}
+
+void serviceSunGuidance(unsigned long now) {
+  if (!orientationAnchorValid ||
+      anchorPanParity == 0 ||
+      effectivePanDirection() != anchorPanParity ||
+      !sunPositionValid ||
+      sunPosition.elevationDeg < MIN_CALIBRATION_SUN_ELEVATION_DEG ||
+      sunPosition.elevationDeg > MAX_GUIDANCE_SUN_ELEVATION_DEG ||
+      trackerMode != TRACKING ||
+      now - lastSunGuidanceStepMs < SUN_GUIDANCE_STEP_INTERVAL_MS) {
+    return;
+  }
+
+  const double azimuthChange = shortestAngleDifference(
+      sunPosition.azimuthDeg, anchorSunAzimuthDeg);
+  const double elevationChange =
+      sunPosition.elevationDeg - anchorSunElevationDeg;
+  if (fabs(azimuthChange) > MAX_ANCHOR_GUIDANCE_CHANGE_DEG ||
+      fabs(elevationChange) > MAX_ANCHOR_GUIDANCE_CHANGE_DEG) {
+    return;
+  }
+
+  const int targetPan = constrain(
+      anchorPanCommand +
+          (int)lround(
+              azimuthChange * anchorPanParity / PAN_DEGREES_PER_COMMAND),
+      PAN_MIN_COMMAND,
+      PAN_MAX_COMMAND);
+  const int targetTilt = constrain(
+      anchorTiltCommand +
+          (int)lround(
+              elevationChange * TILT_DIRECTION /
+              TILT_DEGREES_PER_COMMAND),
+      TILT_MIN_COMMAND,
+      TILT_MAX_COMMAND);
+
+  // A local one-point calibration is not trustworthy across the pan-axis
+  // singularity. Let measured LDR recovery handle that geometry instead.
+  const bool crossesTiltAxis =
+      (anchorTiltCommand < TILT_AXIS_ALIGNMENT_COMMAND &&
+       targetTilt >= TILT_AXIS_ALIGNMENT_COMMAND) ||
+      (anchorTiltCommand > TILT_AXIS_ALIGNMENT_COMMAND &&
+       targetTilt <= TILT_AXIS_ALIGNMENT_COMMAND);
+  if (crossesTiltAxis) return;
+
+  const int nextPan = approachCommand(panAngle, targetPan, 1);
+  const int nextTilt = approachCommand(tiltAngle, targetTilt, 1);
+  if (nextPan != panAngle) {
+    panAngle = nextPan;
+    panServo.write(panAngle);
+  }
+  if (nextTilt != tiltAngle) {
+    tiltAngle = nextTilt;
+    tiltServo.write(tiltAngle);
+  }
+  lastSunGuidanceStepMs = now;
+}
+
 void updateLimitRequest(LimitReason reason, unsigned long now) {
   if (reason == NO_LIMIT) {
     pendingLimitReason = NO_LIMIT;
     limitTimerRunning = false;
-    recoveryHoldActive = false;
+    const bool strongPatternChange =
+        ldrTrackingActive &&
+        (abs(horizontalError - recoveryHoldHorizontalError) >
+             LIGHT_DEADBAND ||
+         abs(verticalError - recoveryHoldVerticalError) >
+             LIGHT_DEADBAND);
+    if (recoveryHoldActive && strongPatternChange) {
+      recoveryHoldActive = false;
+      Serial.println("LDR pattern changed: recovered pose re-armed.");
+    }
     return;
   }
 
   if (recoveryHoldActive) {
     const bool lightChanged =
-        abs(horizontalError - recoveryHoldHorizontalError) > LIGHT_DEADBAND ||
-        abs(verticalError - recoveryHoldVerticalError) > LIGHT_DEADBAND;
+        ldrTrackingActive &&
+        (abs(horizontalError - recoveryHoldHorizontalError) >
+             LIGHT_DEADBAND ||
+         abs(verticalError - recoveryHoldVerticalError) >
+             LIGHT_DEADBAND);
     if (!lightChanged) {
       pendingLimitReason = reason;
       limitTimerRunning = false;
@@ -518,8 +1173,12 @@ void serviceRecovery(unsigned long now) {
   }
 }
 
-bool cloudConfigured() {
-  return SECRET_SSID[0] != '\0' &&
+bool wifiConfigured() {
+  return SECRET_SSID[0] != '\0';
+}
+
+bool thingSpeakConfigured() {
+  return wifiConfigured() &&
          SECRET_CH_ID != 0 &&
          SECRET_WRITE_APIKEY[0] != '\0';
 }
@@ -534,13 +1193,19 @@ void beginWifiAttempt(unsigned long now) {
 }
 
 void serviceWifi(unsigned long now) {
-  if (!cloudConfigured()) return;
+  if (!wifiConfigured()) return;
 
   if (WiFi.status() == WL_CONNECTED) {
     if (!wifiWasConnected) {
       wifiWasConnected = true;
       Serial.print("Wi-Fi connected. IP: ");
       Serial.println(WiFi.localIP());
+
+      if (!ntpStarted) {
+        configTime(0, 0, NTP_SERVER_1, NTP_SERVER_2);
+        ntpStarted = true;
+        Serial.println("NTP synchronization requested (UTC).");
+      }
     }
     return;
   }
@@ -556,47 +1221,145 @@ void serviceWifi(unsigned long now) {
   }
 }
 
+void serviceGeolocation(unsigned long now) {
+  bool resultReady = false;
+  bool succeeded = false;
+  double resultLatitude = 0.0;
+  double resultLongitude = 0.0;
+
+  portENTER_CRITICAL(&geolocationMux);
+  if (geolocationResult.resultReady) {
+    resultReady = true;
+    succeeded = geolocationResult.succeeded;
+    resultLatitude = geolocationResult.latitudeDeg;
+    resultLongitude = geolocationResult.longitudeDeg;
+    geolocationResult.resultReady = false;
+  }
+  portEXIT_CRITICAL(&geolocationMux);
+
+  if (resultReady) {
+    if (succeeded) {
+      automaticLocationResolved = true;
+      applyLocation(
+          resultLatitude, resultLongitude, "public-IP estimate", true);
+    } else {
+      Serial.println(
+          "Automatic IP location failed; cached location remains active.");
+    }
+  }
+
+  if (locationIsManual || automaticLocationResolved ||
+      WiFi.status() != WL_CONNECTED ||
+      geolocationTaskIsRunning() ||
+      thingSpeakTaskIsRunning()) {
+    return;
+  }
+
+  if (!geolocationAttempted ||
+      now - lastGeolocationAttemptMs >= GEOLOCATION_RETRY_INTERVAL_MS) {
+    startGeolocationTask(now);
+  }
+}
+
+void serviceSunEstimator(unsigned long now) {
+  const time_t utcEpoch = time(nullptr);
+  const bool synchronized = utcEpoch >= 1700000000;
+  if (!synchronized || !locationValid) return;
+
+  if (!timeValid) {
+    timeValid = true;
+    Serial.println("UTC date/time synchronized automatically.");
+  }
+
+  if (sunPositionValid &&
+      now - lastSunUpdateMs < SUN_UPDATE_INTERVAL_MS) {
+    return;
+  }
+
+  SunPosition estimate;
+  if (!estimateSunPosition(
+          utcEpoch, latitudeDeg, longitudeDeg, estimate)) {
+    return;
+  }
+
+  sunPosition = estimate;
+  sunPositionValid = true;
+  lastSunUpdateMs = now;
+  const bool nowCalibratable =
+      sunPosition.elevationDeg >= MIN_CALIBRATION_SUN_ELEVATION_DEG;
+  if (nowCalibratable && !sunCalibratable) {
+    sunBecameCalibratableMs = now;
+    orientationProgressInitialized = false;
+  }
+  sunCalibratable = nowCalibratable;
+
+  struct tm utc;
+  gmtime_r(&utcEpoch, &utc);
+  char utcText[24];
+  strftime(utcText, sizeof(utcText), "%Y-%m-%d %H:%M:%S", &utc);
+  Serial.print("Sun estimate UTC=");
+  Serial.print(utcText);
+  Serial.print(" az/el=");
+  Serial.print(sunPosition.azimuthDeg, 1);
+  Serial.print('/');
+  Serial.print(sunPosition.elevationDeg, 1);
+  Serial.println(" deg");
+}
+
 void serviceThingSpeak(unsigned long now) {
-  if (!cloudConfigured() || WiFi.status() != WL_CONNECTED) return;
+  bool resultReady = false;
+  int completedStatusCode = 0;
+  portENTER_CRITICAL(&thingSpeakMux);
+  if (thingSpeakTaskState.resultReady) {
+    resultReady = true;
+    completedStatusCode = thingSpeakTaskState.statusCode;
+    thingSpeakTaskState.resultReady = false;
+  }
+  portEXIT_CRITICAL(&thingSpeakMux);
+
+  if (resultReady) {
+    if (completedStatusCode == 200) {
+      Serial.println("ThingSpeak update successful.");
+    } else {
+      Serial.print("ThingSpeak update failed, code: ");
+      Serial.println(completedStatusCode);
+    }
+  }
+
+  if (!thingSpeakConfigured() ||
+      WiFi.status() != WL_CONNECTED ||
+      geolocationTaskIsRunning() ||
+      thingSpeakTaskIsRunning()) {
+    return;
+  }
 
   if (thingSpeakUploadAttempted &&
       now - lastThingSpeakUploadMs < THINGSPEAK_UPLOAD_INTERVAL_MS) {
     return;
   }
 
-  // One write sends all six values to the same ThingSpeak entry.
-  ThingSpeak.setField(1, topLeft);
-  ThingSpeak.setField(2, topRight);
-  ThingSpeak.setField(3, bottomLeft);
-  ThingSpeak.setField(4, bottomRight);
-  ThingSpeak.setField(5, panAngle);
-  ThingSpeak.setField(6, tiltAngle);
-
-  lastThingSpeakUploadMs = now;
-  thingSpeakUploadAttempted = true;
-
-  const int statusCode =
-      ThingSpeak.writeFields(SECRET_CH_ID, SECRET_WRITE_APIKEY);
-  if (statusCode == 200) {
-    Serial.println("ThingSpeak update successful.");
-  } else {
-    Serial.print("ThingSpeak update failed, code: ");
-    Serial.println(statusCode);
-  }
+  startThingSpeakUploadTask(now);
 }
 
 void setup() {
   Serial.begin(115200);
+
+  solarPreferences.begin("solartrack", false);
+  loadLocationConfiguration();
 
   WiFi.mode(WIFI_STA);
   Serial.print("ESP32 Wi-Fi MAC: ");
   Serial.println(WiFi.macAddress());
   ThingSpeak.begin(thingSpeakClient);
 
-  if (cloudConfigured()) {
+  if (wifiConfigured()) {
     beginWifiAttempt(millis());
   } else {
-    Serial.println("ThingSpeak disabled: fill in secrets.h first.");
+    Serial.println(
+        "Wi-Fi time/location and ThingSpeak disabled: set SECRET_SSID.");
+  }
+  if (!thingSpeakConfigured()) {
+    Serial.println("ThingSpeak disabled: set channel ID and Write API key.");
   }
 
   analogReadResolution(12);
@@ -630,22 +1393,38 @@ void loop() {
     lastUpdateMs = now;
 
     updateLdrReadings();
+    const int currentBrightness = totalBrightness();
+    if (ldrTrackingActive &&
+        currentBrightness < LDR_TRACKING_EXIT_BRIGHTNESS) {
+      ldrTrackingActive = false;
+    } else if (!ldrTrackingActive &&
+               currentBrightness > LDR_TRACKING_ENTER_BRIGHTNESS) {
+      ldrTrackingActive = true;
+    }
+    serviceOrientationDetection(now);
 
     if (trackerMode == TRACKING) {
       int requestedPanDelta = 0;
       int requestedTiltDelta = 0;
+      const bool ldrTrackingUsable = ldrTrackingActive;
 
-      if (abs(horizontalError) > LIGHT_DEADBAND) {
-        requestedPanDelta =
-            signOf(horizontalError) *
-            effectivePanDirection() *
-            movementStep(abs(horizontalError));
-      }
-      if (abs(verticalError) > LIGHT_DEADBAND) {
-        requestedTiltDelta =
-            signOf(verticalError) *
-            TILT_DIRECTION *
-            movementStep(abs(verticalError));
+      if (ldrTrackingUsable) {
+        if (abs(horizontalError) > LIGHT_DEADBAND) {
+          requestedPanDelta =
+              signOf(horizontalError) *
+              effectivePanDirection() *
+              movementStep(abs(horizontalError));
+        }
+        if (abs(verticalError) > LIGHT_DEADBAND) {
+          requestedTiltDelta =
+              signOf(verticalError) *
+              TILT_DIRECTION *
+              movementStep(abs(verticalError));
+        }
+      } else {
+        // Under weak/diffuse light, noisy LDR differences cannot be trusted.
+        // Use only the small, locally calibrated astronomical correction.
+        serviceSunGuidance(now);
       }
 
       const bool panBlockedAtMin =
@@ -661,6 +1440,7 @@ void loop() {
           tiltAngle >= TILT_MAX_COMMAND && requestedTiltDelta > 0 &&
           abs(verticalError) >= LIMIT_TRIGGER_ERROR;
       const bool panBlockedAtZenith =
+          ldrTrackingUsable &&
           effectivePanDirection() == 0 &&
           abs(horizontalError) >= LIMIT_TRIGGER_ERROR;
 
@@ -718,10 +1498,29 @@ void loop() {
     Serial.print("  score=");
     Serial.print(opticalScore());
     Serial.print("  mode=");
-    Serial.println(trackerModeName());
+    Serial.print(trackerModeName());
+    if (sunPositionValid) {
+      Serial.print("  sun az/el=");
+      Serial.print(sunPosition.azimuthDeg, 1);
+      Serial.print('/');
+      Serial.print(sunPosition.elevationDeg, 1);
+    }
+    double panelAzimuth = 0.0;
+    double panelElevation = 0.0;
+    if (estimatePanelDirection(panelAzimuth, panelElevation)) {
+      Serial.print("  panel az/el=");
+      Serial.print(panelAzimuth, 1);
+      Serial.print('/');
+      Serial.print(panelElevation, 1);
+    } else if (sunPositionValid) {
+      Serial.print("  panel direction=acquiring");
+    }
+    Serial.println();
   }
 
   serviceWifi(now);
+  serviceGeolocation(now);
+  serviceSunEstimator(now);
   serviceThingSpeak(now);
 
   // Yield to the ESP32 Wi-Fi stack without slowing the 20 ms tracker loop.
